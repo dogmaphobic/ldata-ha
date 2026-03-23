@@ -6,7 +6,6 @@ import copy
 import datetime
 from dataclasses import dataclass
 import logging
-import time
 from typing import Any
 
 import voluptuous as vol
@@ -27,7 +26,6 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_platform
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -52,6 +50,30 @@ SERVICE_RESET_ENERGY_SCHEMA = {
     vol.Optional(ATTR_VALUE): vol.Coerce(float),
     vol.Optional(ATTR_BASELINE): vol.Coerce(float),
 }
+
+COUNTER_DROP_MIN_DELTA_KWH = 0.1
+COUNTER_DROP_CONFIRMATIONS = 5
+COUNTER_DROP_TOLERANCE_KWH = 0.01
+
+
+def _resolved_energy_key(coordinator: LDATAUpdateCoordinator, panel_id: str | None, key: str) -> str:
+    """Prefer raw hardware counters when the panel exposes them."""
+    if panel_id and coordinator.service.panel_has_hw_counters(panel_id):
+        return key
+    return f"estimated_{key}"
+
+
+def _advance_counter_drop_guard(
+    pending_value: float | None, pending_count: int, current_total: float
+) -> tuple[float, int, bool]:
+    """Require repeated lower totals before treating a counter drop as real."""
+    if pending_value is not None and abs(current_total - pending_value) <= COUNTER_DROP_TOLERANCE_KWH:
+        pending_count += 1
+    else:
+        pending_value = current_total
+        pending_count = 1
+
+    return pending_value, pending_count, pending_count >= COUNTER_DROP_CONFIRMATIONS
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -200,7 +222,7 @@ async def async_setup_entry(
 
 
 class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
-    """Sensor that tracks daily energy usage using ldata_service.py's Riemann engine."""
+    """Track daily energy from raw counters when available, estimates otherwise."""
 
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_device_class = SensorDeviceClass.ENERGY
@@ -213,11 +235,12 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
         super().__init__(data=data, coordinator=coordinator)
         self.breaker_data = data
         self._state: float | None = None
-        self._last_reported: float | None = None
         self.panel_id = which_panel
         self._midnight_baseline: float | None = None
         self._last_date: datetime.date | None = None
         self._energy_key: str | None = None
+        self._pending_drop_value: float | None = None
+        self._pending_drop_count = 0
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(self.coordinator.async_add_listener(self._state_update))
@@ -225,8 +248,6 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
         if last_state := await self.async_get_last_state():
             try:
                 self._state = float(last_state.state)
-                # PERFECT REBOOT SURVIVAL: Restore the lock from Home Assistant DB
-                self._last_reported = self._state
             except (ValueError, TypeError):
                 pass
             attrs = last_state.attributes or {}
@@ -244,15 +265,14 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
 
     async def async_reset_baseline(self, value: float | None = None, baseline: float | None = None) -> None:
         """Handle the reset_energy_baseline service call natively."""
+        self._clear_pending_drop()
         if baseline is not None:
             self._midnight_baseline = baseline
         if value is not None:
             self._state = value
-            self._last_reported = value  # Release the lock allowing new manual value
         elif baseline is None and value is None:
             self._midnight_baseline = None
             self._state = 0.0
-            self._last_reported = 0.0  # Release the lock allowing instant flatline drop
         self.async_write_ha_state()
 
     @property
@@ -262,6 +282,7 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
         attributes["last_date"] = self._last_date.isoformat() if self._last_date else None
         attributes["energy_key"] = self._energy_key
         attributes["panel_energy_key"] = self._panel_energy_key
+        attributes["energy_source"] = "hardware" if self._uses_hardware_counters() else "estimated"
         return attributes
 
     @property
@@ -283,19 +304,52 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
     @property
     def native_value(self) -> StateType:
         if self._state is not None:
-            val = round(self._state, 2)
-            # ABSOLUTE MONOTONIC LOCK (Protects graph from software drift wipes)
-            if self._last_reported is not None and val < self._last_reported:
-                return self._last_reported
-            self._last_reported = val
-            return val
+            return round(self._state, 2)
         return 0.0
+
+    def _energy_panel_id(self) -> str | None:
+        if self.panel_total:
+            return self.panel_id
+        return self.breaker_data.get("panel_id")
+
+    def _uses_hardware_counters(self) -> bool:
+        return self.coordinator.service.panel_has_hw_counters(self._energy_panel_id() or "")
+
+    def _device_energy_key(self, key: str) -> str:
+        return _resolved_energy_key(self.coordinator, self._energy_panel_id(), key)
+
+    def _clear_pending_drop(self) -> None:
+        self._pending_drop_value = None
+        self._pending_drop_count = 0
+
+    def _accept_persistent_drop(self, current_total: float) -> bool:
+        self._pending_drop_value, self._pending_drop_count, accepted = _advance_counter_drop_guard(
+            self._pending_drop_value,
+            self._pending_drop_count,
+            current_total,
+        )
+        if not accepted:
+            return False
+
+        _LOGGER.warning(
+            "Re-baselining %s after %d consecutive lower energy totals (baseline=%.3f, current=%.3f)",
+            self.entity_id,
+            self._pending_drop_count,
+            self._midnight_baseline or 0.0,
+            current_total,
+        )
+        self._clear_pending_drop()
+        self._midnight_baseline = current_total
+        self._state = 0.0
+        return True
 
     def _detect_energy_key(self) -> str:
         if breakers := self.coordinator.data.get("breakers"):
             if breaker := breakers.get(self.breaker_data["id"]):
-                imp = float(breaker.get("import", 0) or 0)
-                cons = float(breaker.get("consumption", 0) or 0)
+                import_key = self._device_energy_key("import")
+                consumption_key = self._device_energy_key("consumption")
+                imp = float(breaker.get(import_key, 0) or 0)
+                cons = float(breaker.get(consumption_key, 0) or 0)
                 if imp > cons and imp > 1.0:
                     return "import"
         return "consumption"
@@ -303,8 +357,7 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
     def _get_breaker_consumption(self) -> float | None:
         if breakers := self.coordinator.data.get("breakers"):
             if breaker := breakers.get(self.breaker_data["id"]):
-                key = self._energy_key or "consumption"
-                val = breaker.get(key)
+                val = breaker.get(self._device_energy_key(self._energy_key or "consumption"))
                 if val is not None:
                     try:
                         return float(val)
@@ -324,12 +377,12 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
                     self._energy_key = self._detect_energy_key()
             today = dt_util.now().date()
             is_new_day = self._last_date is not None and self._last_date != today
-            
+
             if self.panel_total:
                 self._update_panel_total(today, is_new_day)
             else:
                 self._update_single_breaker(today, is_new_day)
-                
+
             self._last_date = today
         except Exception:
             _LOGGER.debug("Error updating daily usage sensor %s", self.name, exc_info=True)
@@ -341,31 +394,35 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
             return
 
         if is_new_day or self._midnight_baseline is None:
+            self._clear_pending_drop()
             self._midnight_baseline = consumption
             self._state = 0.0
-            self._last_reported = 0.0  # Unlock for midnight flip
             return
 
         daily = consumption - self._midnight_baseline
         if daily < 0:
-            if daily <= -0.1:
-                self._midnight_baseline = consumption
-                self._state = 0.0
-                self._last_reported = 0.0
+            if daily <= -COUNTER_DROP_MIN_DELTA_KWH:
+                self._accept_persistent_drop(consumption)
             return
-            
+
+        self._clear_pending_drop()
         if daily > MAX_DAILY_ENERGY_KWH:
+            _LOGGER.warning(
+                "Daily energy %.1f kWh for %s exceeded sanity cap; re-baselining at %.3f",
+                daily,
+                self.entity_id,
+                consumption,
+            )
             self._midnight_baseline = consumption
             daily = 0.0
-            self._last_reported = 0.0
 
         self._state = daily
 
     def _update_panel_total(self, today: datetime.date, is_new_day: bool):
-        key = self._panel_energy_key
+        key = self._device_energy_key(self._panel_energy_key)
         cts = self.coordinator.data.get("cts", {})
         panel_cts = {b_id: b_data for b_id, b_data in cts.items() if b_data.get("panel_id") == self.panel_id}
-        
+
         if panel_cts:
             data_to_sum = panel_cts
         else:
@@ -376,7 +433,7 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
             return
 
         current_lifetime_sum = 0.0
-        for b_id, b_data in data_to_sum.items():
+        for b_data in data_to_sum.values():
             val = b_data.get(key)
             if val is not None:
                 try:
@@ -385,23 +442,27 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
                     pass
 
         if is_new_day or self._midnight_baseline is None:
+            self._clear_pending_drop()
             self._midnight_baseline = current_lifetime_sum
             self._state = 0.0
-            self._last_reported = 0.0  # Unlock for midnight flip
             return
 
         daily = current_lifetime_sum - self._midnight_baseline
         if daily < 0:
-            if daily <= -0.1:
-                self._midnight_baseline = current_lifetime_sum
-                self._state = 0.0
-                self._last_reported = 0.0
+            if daily <= -COUNTER_DROP_MIN_DELTA_KWH:
+                self._accept_persistent_drop(current_lifetime_sum)
             return
-            
+
+        self._clear_pending_drop()
         if daily > MAX_DAILY_ENERGY_KWH:
+            _LOGGER.warning(
+                "Panel daily energy %.1f kWh for %s exceeded sanity cap; re-baselining at %.3f",
+                daily,
+                self.entity_id,
+                current_lifetime_sum,
+            )
             self._midnight_baseline = current_lifetime_sum
             daily = 0.0
-            self._last_reported = 0.0
 
         self._state = daily
 
@@ -416,9 +477,10 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
         super().__init__(data=data, coordinator=coordinator)
         self.breaker_data = data
         self._state: float | None = None
-        self._last_reported: float | None = None
         self._midnight_baseline: float | None = None
         self._last_date: datetime.date | None = None
+        self._pending_drop_value: float | None = None
+        self._pending_drop_count = 0
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(self.coordinator.async_add_listener(self._state_update))
@@ -426,8 +488,6 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
         if last_state := await self.async_get_last_state():
             try:
                 self._state = float(last_state.state)
-                # PERFECT REBOOT SURVIVAL: Restore the lock from Home Assistant DB
-                self._last_reported = self._state
             except (ValueError, TypeError):
                 pass
             attrs = last_state.attributes or {}
@@ -442,15 +502,14 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
                     self._last_date = None
 
     async def async_reset_baseline(self, value: float | None = None, baseline: float | None = None) -> None:
+        self._clear_pending_drop()
         if baseline is not None:
             self._midnight_baseline = baseline
         if value is not None:
             self._state = value
-            self._last_reported = value  # Release the lock allowing new manual value
         elif baseline is None and value is None:
             self._midnight_baseline = None
             self._state = 0.0
-            self._last_reported = 0.0  # Release the lock allowing instant flatline drop
         self.async_write_ha_state()
 
     @property
@@ -468,12 +527,7 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
     @property
     def native_value(self) -> StateType:
         if self._state is not None:
-            val = round(self._state, 2)
-            # ABSOLUTE MONOTONIC LOCK (Protects graph from software drift wipes)
-            if self._last_reported is not None and val < self._last_reported:
-                return self._last_reported
-            self._last_reported = val
-            return val
+            return round(self._state, 2)
         return 0.0
 
     @property
@@ -481,7 +535,36 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
         attributes = super().extra_state_attributes
         attributes["midnight_baseline"] = self._midnight_baseline
         attributes["last_date"] = self._last_date.isoformat() if self._last_date else None
+        attributes["energy_source"] = "hardware" if self._uses_hardware_counters() else "estimated"
         return attributes
+
+    def _uses_hardware_counters(self) -> bool:
+        return self.coordinator.service.panel_has_hw_counters(self.breaker_data.get("panel_id", ""))
+
+    def _clear_pending_drop(self) -> None:
+        self._pending_drop_value = None
+        self._pending_drop_count = 0
+
+    def _accept_persistent_drop(self, current_total: float) -> bool:
+        self._pending_drop_value, self._pending_drop_count, accepted = _advance_counter_drop_guard(
+            self._pending_drop_value,
+            self._pending_drop_count,
+            current_total,
+        )
+        if not accepted:
+            return False
+
+        _LOGGER.warning(
+            "Re-baselining %s after %d consecutive lower energy totals (baseline=%.3f, current=%.3f)",
+            self.entity_id,
+            self._pending_drop_count,
+            self._midnight_baseline or 0.0,
+            current_total,
+        )
+        self._clear_pending_drop()
+        self._midnight_baseline = current_total
+        self._state = 0.0
+        return True
 
     def _get_ct_consumption(self) -> float | None:
         if not self.coordinator.data or "cts" not in self.coordinator.data:
@@ -489,7 +572,7 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
         ct_data = self.coordinator.data["cts"].get(self.breaker_data["id"])
         if ct_data is None:
             return None
-        val = ct_data.get(self._energy_key)
+        val = ct_data.get(_resolved_energy_key(self.coordinator, self.breaker_data.get("panel_id"), self._energy_key))
         if val is not None:
             try:
                 return float(val)
@@ -508,21 +591,25 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
             consumption = self._get_ct_consumption()
             if consumption is not None:
                 if is_new_day or self._midnight_baseline is None:
+                    self._clear_pending_drop()
                     self._midnight_baseline = consumption
                     self._state = 0.0
-                    self._last_reported = 0.0  # Unlock for midnight flip
                 else:
                     daily = consumption - self._midnight_baseline
                     if daily < 0:
-                        if daily <= -0.1:
-                            self._midnight_baseline = consumption
-                            self._state = 0.0
-                            self._last_reported = 0.0
+                        if daily <= -COUNTER_DROP_MIN_DELTA_KWH:
+                            self._accept_persistent_drop(consumption)
                     else:
+                        self._clear_pending_drop()
                         if daily > MAX_DAILY_ENERGY_KWH:
+                            _LOGGER.warning(
+                                "CT daily energy %.1f kWh for %s exceeded sanity cap; re-baselining at %.3f",
+                                daily,
+                                self.entity_id,
+                                consumption,
+                            )
                             self._midnight_baseline = consumption
                             self._state = 0.0
-                            self._last_reported = 0.0
                         else:
                             self._state = daily
 
@@ -671,7 +758,6 @@ class LDATABreakerEnergyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
         super().__init__(data=data, coordinator=coordinator)
         self.breaker_data = data
         self._state = None
-        self._last_reported: float | None = None
 
     @property
     def available(self) -> bool:
@@ -683,7 +769,6 @@ class LDATABreakerEnergyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
         if last_state := await self.async_get_last_state():
             try:
                 self._state = float(last_state.state)
-                self._last_reported = self._state
             except (ValueError, TypeError):
                 pass
 
@@ -692,7 +777,13 @@ class LDATABreakerEnergyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
         try:
             if breakers := self.coordinator.data.get("breakers"):
                 if new_data := breakers.get(self.breaker_data["id"]):
-                    raw = new_data.get(self.entity_description.key)
+                    raw = new_data.get(
+                        _resolved_energy_key(
+                            self.coordinator,
+                            self.breaker_data.get("panel_id"),
+                            self.entity_description.key,
+                        )
+                    )
                     if raw is not None:
                         self._state = float(raw)
         except (KeyError, ValueError, TypeError):
@@ -710,11 +801,7 @@ class LDATABreakerEnergyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
     @property
     def native_value(self) -> StateType:
         if self._state is not None:
-            val = round(self._state, 2)
-            if self._last_reported is not None and val < self._last_reported:
-                return self._last_reported
-            self._last_reported = val
-            return val
+            return round(self._state, 2)
         return self._state
 
 
@@ -818,7 +905,6 @@ class LDATAEnergyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
         super().__init__(data=data, coordinator=coordinator)
         self.ct_data = data
         self._state = None
-        self._last_reported: float | None = None
 
     @property
     def available(self) -> bool:
@@ -830,7 +916,6 @@ class LDATAEnergyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
         if last_state := await self.async_get_last_state():
             try:
                 self._state = float(last_state.state)
-                self._last_reported = self._state
             except (ValueError, TypeError):
                 pass
 
@@ -839,7 +924,13 @@ class LDATAEnergyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
         try:
             if cts := self.coordinator.data.get("cts"):
                 if new_data := cts.get(self.ct_data["id"]):
-                    raw = new_data.get(self.entity_description.key)
+                    raw = new_data.get(
+                        _resolved_energy_key(
+                            self.coordinator,
+                            self.ct_data.get("panel_id"),
+                            self.entity_description.key,
+                        )
+                    )
                     if raw is not None:
                         self._state = float(raw)
         except (KeyError, ValueError, TypeError):
@@ -857,11 +948,7 @@ class LDATAEnergyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
     @property
     def native_value(self) -> StateType:
         if self._state is not None:
-            val = round(self._state, 2)
-            if self._last_reported is not None and val < self._last_reported:
-                return self._last_reported
-            self._last_reported = val
-            return val
+            return round(self._state, 2)
         return self._state
 
 

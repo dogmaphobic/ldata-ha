@@ -181,6 +181,7 @@ class LDATAService:
         for panel in panels_json:
             panel_id = panel.get("id")
             if not panel_id: continue
+            panel_has_hw_counters = False
             
             panel_data = {
                 "firmware": panel.get("updateVersion", "unknown"),
@@ -232,6 +233,8 @@ class LDATAService:
                 self._panel_needs_ct_poll[panel_id] = True
                 for ct in panel["CTs"]:
                     if ct.get("usageType") != "NOT_USED":
+                        if any(key in ct for key in ("energyConsumption", "energyConsumption2", "energyImport", "energyImport2")):
+                            panel_has_hw_counters = True
                         ct_data = {}
                         ct_data["name"] = ct["usageType"]
                         ct_data["id"] = str(ct["id"])
@@ -267,8 +270,7 @@ class LDATAService:
                             ct_data["last_ws_event_time"] = time.time()
                             ct_data["last_ws_power"] = ct_data["power"]
                             
-                        ct_data["consumption"] = ct_data["consumption1"] + ct_data["consumption2"] + ct_data["drift_accumulator_consumption"]
-                        ct_data["import"] = ct_data["import1"] + ct_data["import2"] + ct_data["drift_accumulator_import"]
+                        self._sync_energy_totals(ct_data)
                         
                         cts[ct_data["id"]] = ct_data
 
@@ -276,6 +278,8 @@ class LDATAService:
             if panel.get("residentialBreakers"):
                 for breaker in panel["residentialBreakers"]:
                     if breaker.get("model") not in (None, "NONE-2", "NONE-1"):
+                        if any(key in breaker for key in ("energyConsumption", "energyConsumption2", "energyImport", "energyImport2")):
+                            panel_has_hw_counters = True
                         breaker_data = {
                             "panel_id": panel_id,
                             "rating": breaker.get("currentRating"),
@@ -361,8 +365,7 @@ class LDATAService:
                             breaker_data["last_ws_event_time"] = time.time()
                             breaker_data["last_ws_power"] = breaker_data["power"] if breaker_data["power"] is not None else 0.0
                             
-                        breaker_data["consumption"] = breaker_data["consumption1"] + breaker_data["consumption2"] + breaker_data["drift_accumulator_consumption"]
-                        breaker_data["import"] = breaker_data["import1"] + breaker_data["import2"] + breaker_data["drift_accumulator_import"]
+                        self._sync_energy_totals(breaker_data)
                         
                         breakers[breaker["id"]] = breaker_data
                         if breaker_data["power"] is not None:
@@ -370,12 +373,7 @@ class LDATAService:
 
             status_data[panel_id + "totalPower"] = total_power
             
-            has_hw = False
-            for b_data in breakers.values():
-                if b_data.get("panel_id") == panel_id and (b_data.get("consumption", 0) > 0 or b_data.get("consumption1", 0) > 0):
-                    has_hw = True
-                    break
-            self._panel_has_hw_counters[panel_id] = has_hw
+            self._panel_has_hw_counters[panel_id] = panel_has_hw_counters
 
             status_data["panels"].append(panel_data)
 
@@ -410,6 +408,23 @@ class LDATAService:
 
         return cached_val
 
+    def _hardware_energy_total(self, data: dict, prefix: str) -> float:
+        """Return the raw Leviton lifetime counter total for a device."""
+        return float(data.get(prefix + "1", 0) or 0) + float(data.get(prefix + "2", 0) or 0)
+
+    def _sync_energy_totals(self, data: dict) -> None:
+        """Keep raw hardware counters separate from software drift estimates."""
+        base_consumption = self._hardware_energy_total(data, "consumption")
+        base_import = self._hardware_energy_total(data, "import")
+
+        # Expose the raw hardware counters under the legacy keys so Home
+        # Assistant sensors can trust them on v2 panels. The Riemann fallback
+        # stays available under separate estimated_* keys for older panels.
+        data["consumption"] = base_consumption
+        data["import"] = base_import
+        data["estimated_consumption"] = base_consumption + float(data.get("drift_accumulator_consumption", 0.0) or 0.0)
+        data["estimated_import"] = base_import + float(data.get("drift_accumulator_import", 0.0) or 0.0)
+
     def advance_all_drift(self):
         """Continuously update the Riemann sums for all active breakers and CTs."""
         if not self.status_data:
@@ -443,10 +458,7 @@ class LDATAService:
                 device_updated = True
                 
             if device_updated:
-                base_consumption = b_data.get("consumption1", 0) + b_data.get("consumption2", 0)
-                b_data["consumption"] = base_consumption + b_data.get("drift_accumulator_consumption", 0.0)
-                base_import = b_data.get("import1", 0) + b_data.get("import2", 0)
-                b_data["import"] = base_import + b_data.get("drift_accumulator_import", 0.0)
+                self._sync_energy_totals(b_data)
                 updated = True
                 
             b_data["last_power_time"] = now
@@ -476,10 +488,7 @@ class LDATAService:
                 device_updated = True
                 
             if device_updated:
-                base_consumption = ct_data.get("consumption1", 0) + ct_data.get("consumption2", 0)
-                ct_data["consumption"] = base_consumption + ct_data.get("drift_accumulator_consumption", 0.0)
-                base_import = ct_data.get("import1", 0) + ct_data.get("import2", 0)
-                ct_data["import"] = base_import + ct_data.get("drift_accumulator_import", 0.0)
+                self._sync_energy_totals(ct_data)
                 updated = True
                 
             ct_data["last_power_time"] = now
@@ -664,10 +673,6 @@ class LDATAService:
                 current_drift = existing.get("drift_accumulator_consumption", 0.0)
                 existing["drift_accumulator_consumption"] = max(0.0, current_drift - hardware_delta)
                 
-        # Apply consumption = Baseline Hardware Counter + Software Drift
-        base_consumption = existing.get("consumption1", 0) + existing.get("consumption2", 0)
-        existing["consumption"] = base_consumption + existing.get("drift_accumulator_consumption", 0.0)
-        
         # IMPORT TRUE-UP
         if "energyImport" in raw or "energyImport2" in raw:
             cached_ei1 = existing.get("import1", 0)
@@ -689,9 +694,7 @@ class LDATAService:
                 current_drift = existing.get("drift_accumulator_import", 0.0)
                 existing["drift_accumulator_import"] = max(0.0, current_drift - hardware_delta)
                 
-        # Apply import = Baseline Hardware Counter + Software Drift
-        base_import = existing.get("import1", 0) + existing.get("import2", 0)
-        existing["import"] = base_import + existing.get("drift_accumulator_import", 0.0)
+        self._sync_energy_totals(existing)
         
         return power_changed
 
@@ -779,10 +782,6 @@ class LDATAService:
                 existing["drift_accumulator_consumption"] = max(0.0, current_drift - hardware_delta)
                 _LOGGER.info("[Energy Sync] Leviton hardware confirmed %.3f kWh consumed. Reduced software drift from %.3f to %.3f", hardware_delta, current_drift, existing["drift_accumulator_consumption"])
 
-        # Apply consumption = Baseline Hardware + Software Drift
-        base_consumption = existing.get("consumption1", 0) + existing.get("consumption2", 0)
-        existing["consumption"] = base_consumption + existing.get("drift_accumulator_consumption", 0.0)
-        
         # IMPORT TRUE-UP
         if "energyImport" in raw or "energyImport2" in raw:
             ct_id = str(existing.get("id", "?"))
@@ -805,9 +804,7 @@ class LDATAService:
                 existing["drift_accumulator_import"] = max(0.0, current_drift - hardware_delta)
                 _LOGGER.info("[Energy Sync] Leviton hardware confirmed %.3f kWh imported. Reduced software drift from %.3f to %.3f", hardware_delta, current_drift, existing["drift_accumulator_import"])
             
-        # Apply import = Baseline Hardware + Software Drift
-        base_import = existing.get("import1", 0) + existing.get("import2", 0)
-        existing["import"] = base_import + existing.get("drift_accumulator_import", 0.0)
+        self._sync_energy_totals(existing)
         
         if "rmsCurrent" in raw or "rmsCurrent2" in raw:
             cached_cur1, cached_cur2 = existing.get("current1", 0), existing.get("current2", 0)
@@ -936,7 +933,18 @@ class LDATAService:
         return any(self._panel_needs_ct_poll.values())
 
     def panel_has_hw_counters(self, panel_id: str) -> bool:
-        return self._panel_has_hw_counters.get(panel_id, False)
+        if panel_id in self._panel_has_hw_counters:
+            return self._panel_has_hw_counters[panel_id]
+
+        # Stored startup data may arrive before parse_panels repopulates the
+        # explicit cache. WHEMS/v2 panels are expected to expose hardware
+        # counters, so use the saved panel type as a safe fallback.
+        if self.status_data:
+            for panel in self.status_data.get("panels", []):
+                if panel.get("id") == panel_id:
+                    return panel.get("panel_type") == "WHEMS"
+
+        return False
 
     async def refresh_panel_data(self) -> bool:
         if not self.status_data or not self.status_data.get("panels"): return False
