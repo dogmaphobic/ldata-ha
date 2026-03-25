@@ -63,6 +63,42 @@ def _resolved_energy_key(coordinator: LDATAUpdateCoordinator, panel_id: str | No
     return f"estimated_{key}"
 
 
+def _resolved_breaker_energy_key(breaker_data: dict[str, Any], key: str) -> str:
+    """Breakers use a guarded hardware counter when available.
+
+    Panel/CT totals can trust the raw hardware counters. Individual breakers are
+    less reliable: some WHEMS payloads intermittently regress to an older raw
+    lifetime total. The service layer keeps a breaker-only effective_* counter
+    monotonic so breaker entities stay stable between those stale snapshots.
+    """
+    if breaker_data.get("has_hw_counters"):
+        return f"effective_{key}"
+    return f"estimated_{key}"
+
+
+def _breaker_energy_source(breaker_data: dict[str, Any]) -> str:
+    """Describe which breaker counter family is driving the entity."""
+    if breaker_data.get("has_hw_counters"):
+        return "hardware_guarded"
+    return "estimated"
+
+
+def _resolved_breaker_daily_energy_key(key: str) -> str:
+    """Daily breaker energy comes from the local Riemann estimate.
+
+    Individual breaker hardware totals have proven less reliable than panel/CT
+    totals. Daily breaker usage is therefore based on the integration's
+    continuously integrated estimate so it stays aligned with live breaker power
+    instead of hourly hardware counter jumps.
+    """
+    return f"estimated_{key}"
+
+
+def _breaker_daily_energy_source() -> str:
+    """Describe which counter family drives breaker daily sensors."""
+    return "estimated"
+
+
 def _advance_counter_drop_guard(
     pending_value: float | None, pending_count: int, current_total: float
 ) -> tuple[float, int, bool]:
@@ -241,6 +277,7 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
         self._energy_key: str | None = None
         self._pending_drop_value: float | None = None
         self._pending_drop_count = 0
+        self._force_rebaseline_from_restore = False
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(self.coordinator.async_add_listener(self._state_update))
@@ -262,6 +299,13 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
                     self._last_date = None
             if "energy_key" in attrs:
                 self._energy_key = attrs["energy_key"]
+            if not self.panel_total and attrs.get("energy_source") != _breaker_daily_energy_source():
+                # A restored baseline from a different counter family is stale by
+                # definition. Drop it and let the current estimate establish a
+                # fresh baseline on the first coordinator update.
+                self._force_rebaseline_from_restore = True
+        if self.coordinator.data:
+            self._state_update()
 
     async def async_reset_baseline(self, value: float | None = None, baseline: float | None = None) -> None:
         """Handle the reset_energy_baseline service call natively."""
@@ -282,7 +326,10 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
         attributes["last_date"] = self._last_date.isoformat() if self._last_date else None
         attributes["energy_key"] = self._energy_key
         attributes["panel_energy_key"] = self._panel_energy_key
-        attributes["energy_source"] = "hardware" if self._uses_hardware_counters() else "estimated"
+        if self.panel_total:
+            attributes["energy_source"] = "hardware" if self._uses_hardware_counters() else "estimated"
+        else:
+            attributes["energy_source"] = _breaker_daily_energy_source()
         return attributes
 
     @property
@@ -346,8 +393,8 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
     def _detect_energy_key(self) -> str:
         if breakers := self.coordinator.data.get("breakers"):
             if breaker := breakers.get(self.breaker_data["id"]):
-                import_key = self._device_energy_key("import")
-                consumption_key = self._device_energy_key("consumption")
+                import_key = _resolved_breaker_daily_energy_key("import")
+                consumption_key = _resolved_breaker_daily_energy_key("consumption")
                 imp = float(breaker.get(import_key, 0) or 0)
                 cons = float(breaker.get(consumption_key, 0) or 0)
                 if imp > cons and imp > 1.0:
@@ -357,7 +404,7 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
     def _get_breaker_consumption(self) -> float | None:
         if breakers := self.coordinator.data.get("breakers"):
             if breaker := breakers.get(self.breaker_data["id"]):
-                val = breaker.get(self._device_energy_key(self._energy_key or "consumption"))
+                val = breaker.get(_resolved_breaker_daily_energy_key(self._energy_key or "consumption"))
                 if val is not None:
                     try:
                         return float(val)
@@ -392,6 +439,12 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
         consumption = self._get_breaker_consumption()
         if consumption is None:
             return
+
+        if self._force_rebaseline_from_restore:
+            self._clear_pending_drop()
+            self._midnight_baseline = None
+            self._state = 0.0
+            self._force_rebaseline_from_restore = False
 
         if is_new_day or self._midnight_baseline is None:
             self._clear_pending_drop()
@@ -500,6 +553,8 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
                     self._last_date = datetime.date.fromisoformat(date_str)
                 except (ValueError, TypeError):
                     self._last_date = None
+        if self.coordinator.data:
+            self._state_update()
 
     async def async_reset_baseline(self, value: float | None = None, baseline: float | None = None) -> None:
         self._clear_pending_drop()
@@ -771,24 +826,26 @@ class LDATABreakerEnergyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
                 self._state = float(last_state.state)
             except (ValueError, TypeError):
                 pass
+        if self.coordinator.data:
+            self._state_update()
 
     @callback
     def _state_update(self):
         try:
             if breakers := self.coordinator.data.get("breakers"):
                 if new_data := breakers.get(self.breaker_data["id"]):
-                    raw = new_data.get(
-                        _resolved_energy_key(
-                            self.coordinator,
-                            self.breaker_data.get("panel_id"),
-                            self.entity_description.key,
-                        )
-                    )
+                    raw = new_data.get(_resolved_breaker_energy_key(new_data, self.entity_description.key))
                     if raw is not None:
                         self._state = float(raw)
         except (KeyError, ValueError, TypeError):
             pass
         self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str]:
+        attributes = super().extra_state_attributes
+        attributes["energy_source"] = _breaker_energy_source(self.breaker_data)
+        return attributes
 
     @property
     def name_suffix(self) -> str | None:
@@ -918,6 +975,8 @@ class LDATAEnergyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
                 self._state = float(last_state.state)
             except (ValueError, TypeError):
                 pass
+        if self.coordinator.data:
+            self._state_update()
 
     @callback
     def _state_update(self):

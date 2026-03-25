@@ -278,7 +278,10 @@ class LDATAService:
             if panel.get("residentialBreakers"):
                 for breaker in panel["residentialBreakers"]:
                     if breaker.get("model") not in (None, "NONE-2", "NONE-1"):
-                        if any(key in breaker for key in ("energyConsumption", "energyConsumption2", "energyImport", "energyImport2")):
+                        breaker_has_hw_counters = any(
+                            key in breaker for key in ("energyConsumption", "energyConsumption2", "energyImport", "energyImport2")
+                        )
+                        if breaker_has_hw_counters:
                             panel_has_hw_counters = True
                         breaker_data = {
                             "panel_id": panel_id,
@@ -298,7 +301,8 @@ class LDATAService:
                             "overCurrent": breaker.get("overCurrent", False),
                             "overVoltage": breaker.get("overVoltage", False),
                             "underVoltage": breaker.get("underVoltage", False),
-                            "blinkLED": breaker.get("blinkLED", False)
+                            "blinkLED": breaker.get("blinkLED", False),
+                            "has_hw_counters": breaker_has_hw_counters,
                         }
                         
                         _ble_rssi = self._parse_float(breaker, "bleRSSI", None)
@@ -349,10 +353,13 @@ class LDATAService:
                         # --- DISK PERSISTENCE MERGE FOR BREAKERS ---
                         old_brk = existing_breakers.get(breaker_data["id"])
                         if old_brk:
+                            breaker_data["has_hw_counters"] = breaker_data["has_hw_counters"] or bool(old_brk.get("has_hw_counters"))
                             breaker_data["drift_accumulator_consumption"] = old_brk.get("drift_accumulator_consumption", 0.0)
                             breaker_data["drift_accumulator_import"] = old_brk.get("drift_accumulator_import", 0.0)
                             breaker_data["speculative_kwh_consumption"] = old_brk.get("speculative_kwh_consumption", 0.0)
                             breaker_data["speculative_kwh_import"] = old_brk.get("speculative_kwh_import", 0.0)
+                            breaker_data["effective_consumption"] = old_brk.get("effective_consumption", 0.0)
+                            breaker_data["effective_import"] = old_brk.get("effective_import", 0.0)
                             breaker_data["last_power_time"] = old_brk.get("last_power_time", time.time())
                             breaker_data["last_ws_event_time"] = old_brk.get("last_ws_event_time", time.time())
                             breaker_data["last_ws_power"] = old_brk.get("last_ws_power", breaker_data["power"] if breaker_data["power"] is not None else 0.0)
@@ -361,6 +368,8 @@ class LDATAService:
                             breaker_data["drift_accumulator_import"] = 0.0
                             breaker_data["speculative_kwh_consumption"] = 0.0
                             breaker_data["speculative_kwh_import"] = 0.0
+                            breaker_data["effective_consumption"] = 0.0
+                            breaker_data["effective_import"] = 0.0
                             breaker_data["last_power_time"] = time.time()
                             breaker_data["last_ws_event_time"] = time.time()
                             breaker_data["last_ws_power"] = breaker_data["power"] if breaker_data["power"] is not None else 0.0
@@ -408,6 +417,19 @@ class LDATAService:
 
         return cached_val
 
+    def _stable_breaker_energy_total(self, data: dict, key: str, raw_total: float) -> float:
+        """Keep breaker hardware totals monotonic across stale snapshot regressions.
+
+        Breaker energy payloads can intermittently fall back to an older raw
+        lifetime value even though panel/CT totals remain sane.  Persist a
+        breaker-only effective total so breaker entities do not bounce between
+        the fresh hardware total and an older stale snapshot.
+        """
+        previous_total = float(data.get(key, 0.0) or 0.0)
+        if raw_total >= previous_total:
+            return raw_total
+        return previous_total
+
     def _hardware_energy_total(self, data: dict, prefix: str) -> float:
         """Return the raw Leviton lifetime counter total for a device."""
         return float(data.get(prefix + "1", 0) or 0) + float(data.get(prefix + "2", 0) or 0)
@@ -424,6 +446,22 @@ class LDATAService:
         data["import"] = base_import
         data["estimated_consumption"] = base_consumption + float(data.get("drift_accumulator_consumption", 0.0) or 0.0)
         data["estimated_import"] = base_import + float(data.get("drift_accumulator_import", 0.0) or 0.0)
+
+        if "position" in data:
+            if data.get("has_hw_counters"):
+                data["effective_consumption"] = self._stable_breaker_energy_total(
+                    data,
+                    "effective_consumption",
+                    base_consumption,
+                )
+                data["effective_import"] = self._stable_breaker_energy_total(
+                    data,
+                    "effective_import",
+                    base_import,
+                )
+            else:
+                data["effective_consumption"] = data["estimated_consumption"]
+                data["effective_import"] = data["estimated_import"]
 
     def advance_all_drift(self):
         """Continuously update the Riemann sums for all active breakers and CTs."""
@@ -638,6 +676,8 @@ class LDATAService:
         if raw.get("remoteState") is not None:
             existing["remoteState"] = raw["remoteState"]
             if existing["remoteState"] == "": existing["remoteState"] = "RemoteON"
+        if any(key in raw for key in ("energyConsumption", "energyConsumption2", "energyImport", "energyImport2")):
+            existing["has_hw_counters"] = True
         
         if "operationalState" in raw: existing["operationalState"] = raw["operationalState"]
         if "overCurrent" in raw: existing["overCurrent"] = raw["overCurrent"]
