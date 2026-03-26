@@ -9,6 +9,7 @@ import json
 
 from .const import (
     _LEG1_POSITIONS, LOGGER_NAME, THREE_PHASE, THREE_PHASE_DEFAULT,
+    HA_INFORM_RATE, HA_INFORM_RATE_DEFAULT, HA_INFORM_RATE_MIN,
     GAP_HANDLING, GAP_HANDLING_DEFAULT, GAP_HANDLING_SKIP, 
     GAP_HANDLING_EXTRAPOLATE, GAP_HANDLING_AVERAGE, 
     GAP_THRESHOLD, GAP_THRESHOLD_DEFAULT
@@ -65,6 +66,88 @@ class LDATAService:
         # ── Energy counter monotonic protection ──────────────────────
         self._energy_decrease_count: dict[str, int] = {}
         self._ENERGY_DECREASE_ACCEPT_THRESHOLD = 5
+
+    def _restore_runtime_integrator_state(
+        self,
+        data: dict,
+        old_data: dict | None,
+        current_power: float | None,
+    ) -> None:
+        """Restore durable energy state but reseed transient websocket runtime fields.
+
+        Drift accumulators are durable state and must survive restart. The
+        websocket-derived runtime fields are not: carrying over an old
+        `last_ws_power` or timestamp lets the next sparse event integrate across
+        an arbitrarily long quiet gap and manufacture phantom energy.
+        """
+        now = time.time()
+        runtime_power = float(current_power or 0.0)
+
+        if old_data:
+            data["drift_accumulator_consumption"] = old_data.get("drift_accumulator_consumption", 0.0)
+            data["drift_accumulator_import"] = old_data.get("drift_accumulator_import", 0.0)
+        else:
+            data["drift_accumulator_consumption"] = 0.0
+            data["drift_accumulator_import"] = 0.0
+
+        # Speculative left-sum state is only valid during a single runtime.
+        data["speculative_kwh_consumption"] = 0.0
+        data["speculative_kwh_import"] = 0.0
+
+        # Seed the runtime integrator from the current snapshot so the next
+        # websocket update only corrects recent time, not time before restart.
+        data["last_power_time"] = now
+        data["last_ws_event_time"] = now
+        data["last_ws_power"] = runtime_power
+
+    def _resolve_gap_correction(
+        self,
+        existing: dict,
+        now: float,
+        old_ws_power: float,
+        new_power_w: float,
+    ) -> tuple[float, float]:
+        """Return the correction window for a websocket power update.
+
+        While the background ticker is alive, it already advanced the Riemann
+        sum using `last_ws_power` on each short tick. In that steady online
+        case, a websocket update should only correct the final interval since
+        the last tick, not the whole gap since the last websocket frame.
+
+        If the ticker was offline or stalled, fall back to the configured gap
+        handling across the full websocket gap.
+        """
+        last_ws_time = float(existing.get("last_ws_event_time") or now)
+        last_tick_time = float(existing.get("last_power_time") or last_ws_time or now)
+        time_since_tick = max(0.0, now - last_tick_time)
+        calc_power_w = (old_ws_power + new_power_w) / 2.0
+        inform_rate = HA_INFORM_RATE_DEFAULT
+        if self.entry and self.entry.options:
+            inform_rate = max(
+                HA_INFORM_RATE_MIN,
+                self.entry.options.get(HA_INFORM_RATE, HA_INFORM_RATE_DEFAULT),
+            )
+        online_tick_window_secs = max(60.0, inform_rate * 2.0)
+
+        if time_since_tick <= online_tick_window_secs:
+            return time_since_tick / 3600.0, calc_power_w
+
+        time_diff_secs = max(0.0, now - last_ws_time)
+        gap_threshold_secs = 300
+        gap_mode = "skip"
+        if self.entry and self.entry.options:
+            gap_threshold_secs = self.entry.options.get(GAP_THRESHOLD, GAP_THRESHOLD_DEFAULT) * 60
+            gap_mode = self.entry.options.get(GAP_HANDLING, GAP_HANDLING_DEFAULT)
+
+        if time_diff_secs > gap_threshold_secs:
+            if gap_mode == GAP_HANDLING_SKIP:
+                return 0.0, calc_power_w
+            if gap_mode == GAP_HANDLING_EXTRAPOLATE:
+                calc_power_w = old_ws_power
+            elif gap_mode == GAP_HANDLING_AVERAGE:
+                calc_power_w = (old_ws_power + new_power_w) / 2.0
+
+        return time_diff_secs / 3600.0, calc_power_w
 
     @property
     def auth_token(self): return self.http.auth_token
@@ -253,22 +336,11 @@ class LDATAService:
                         
                         # --- DISK PERSISTENCE MERGE FOR CTS ---
                         old_ct = existing_cts.get(ct_data["id"])
-                        if old_ct:
-                            ct_data["drift_accumulator_consumption"] = old_ct.get("drift_accumulator_consumption", 0.0)
-                            ct_data["drift_accumulator_import"] = old_ct.get("drift_accumulator_import", 0.0)
-                            ct_data["speculative_kwh_consumption"] = old_ct.get("speculative_kwh_consumption", 0.0)
-                            ct_data["speculative_kwh_import"] = old_ct.get("speculative_kwh_import", 0.0)
-                            ct_data["last_power_time"] = old_ct.get("last_power_time", time.time())
-                            ct_data["last_ws_event_time"] = old_ct.get("last_ws_event_time", time.time())
-                            ct_data["last_ws_power"] = old_ct.get("last_ws_power", ct_data["power"])
-                        else:
-                            ct_data["drift_accumulator_consumption"] = 0.0
-                            ct_data["drift_accumulator_import"] = 0.0
-                            ct_data["speculative_kwh_consumption"] = 0.0
-                            ct_data["speculative_kwh_import"] = 0.0
-                            ct_data["last_power_time"] = time.time()
-                            ct_data["last_ws_event_time"] = time.time()
-                            ct_data["last_ws_power"] = ct_data["power"]
+                        self._restore_runtime_integrator_state(
+                            ct_data,
+                            old_ct,
+                            ct_data["power"],
+                        )
                             
                         self._sync_energy_totals(ct_data)
                         
@@ -354,25 +426,16 @@ class LDATAService:
                         old_brk = existing_breakers.get(breaker_data["id"])
                         if old_brk:
                             breaker_data["has_hw_counters"] = breaker_data["has_hw_counters"] or bool(old_brk.get("has_hw_counters"))
-                            breaker_data["drift_accumulator_consumption"] = old_brk.get("drift_accumulator_consumption", 0.0)
-                            breaker_data["drift_accumulator_import"] = old_brk.get("drift_accumulator_import", 0.0)
-                            breaker_data["speculative_kwh_consumption"] = old_brk.get("speculative_kwh_consumption", 0.0)
-                            breaker_data["speculative_kwh_import"] = old_brk.get("speculative_kwh_import", 0.0)
                             breaker_data["effective_consumption"] = old_brk.get("effective_consumption", 0.0)
                             breaker_data["effective_import"] = old_brk.get("effective_import", 0.0)
-                            breaker_data["last_power_time"] = old_brk.get("last_power_time", time.time())
-                            breaker_data["last_ws_event_time"] = old_brk.get("last_ws_event_time", time.time())
-                            breaker_data["last_ws_power"] = old_brk.get("last_ws_power", breaker_data["power"] if breaker_data["power"] is not None else 0.0)
                         else:
-                            breaker_data["drift_accumulator_consumption"] = 0.0
-                            breaker_data["drift_accumulator_import"] = 0.0
-                            breaker_data["speculative_kwh_consumption"] = 0.0
-                            breaker_data["speculative_kwh_import"] = 0.0
                             breaker_data["effective_consumption"] = 0.0
                             breaker_data["effective_import"] = 0.0
-                            breaker_data["last_power_time"] = time.time()
-                            breaker_data["last_ws_event_time"] = time.time()
-                            breaker_data["last_ws_power"] = breaker_data["power"] if breaker_data["power"] is not None else 0.0
+                        self._restore_runtime_integrator_state(
+                            breaker_data,
+                            old_brk,
+                            breaker_data["power"],
+                        )
                             
                         self._sync_energy_totals(breaker_data)
                         
@@ -539,37 +602,18 @@ class LDATAService:
         now = time.time()
         last_ws_time = existing.get("last_ws_event_time")
         if last_ws_time:
-            time_diff_secs = now - last_ws_time
-            time_diff_hours = time_diff_secs / 3600.0
-            
             old_ws_power = existing.get("last_ws_power", existing.get("power", 0) or 0)
                 
             p1 = float(raw.get("power", existing.get("power1", 0)) or 0)
             p2 = float(raw.get("power2", existing.get("power2", 0)) or 0)
             new_power_w = p1 + p2
 
-            # TRAPEZOIDAL INTEGRATOR: Average for the entire gap since the last REAL websocket event
-            calc_power_w = (old_ws_power + new_power_w) / 2.0
-
-            # --- GAP HANDLING LOGIC ---
-            gap_threshold_secs = 300
-            gap_mode = "skip"
-            if self.entry and self.entry.options:
-                gap_threshold_secs = self.entry.options.get(GAP_THRESHOLD, GAP_THRESHOLD_DEFAULT) * 60
-                gap_mode = self.entry.options.get(GAP_HANDLING, GAP_HANDLING_DEFAULT)
-                
-            is_v1 = self._panel_type.get(existing.get("panel_id")) == "LDATA"
-
-            # V1 Panels don't send events during steady loads. 
-            # Only trigger Gap Handler if the background tick stopped (i.e. integration went offline)
-            time_since_tick = now - existing.get("last_power_time", now)
-            was_offline = time_since_tick > 60
-            
-            if time_diff_secs > gap_threshold_secs and is_v1 and was_offline:
-                if gap_mode == GAP_HANDLING_SKIP:
-                    time_diff_hours = 0.0
-                elif gap_mode == GAP_HANDLING_EXTRAPOLATE:
-                    calc_power_w = old_ws_power
+            time_diff_hours, calc_power_w = self._resolve_gap_correction(
+                existing,
+                now,
+                float(old_ws_power),
+                new_power_w,
+            )
 
             # 1. UNDO the speculative Left sums added by the continuous tick
             existing["drift_accumulator_consumption"] = max(0.0, existing.get("drift_accumulator_consumption", 0.0) - existing.get("speculative_kwh_consumption", 0.0))
@@ -742,35 +786,18 @@ class LDATAService:
         now = time.time()
         last_ws_time = existing.get("last_ws_event_time")
         if last_ws_time:
-            time_diff_secs = now - last_ws_time
-            time_diff_hours = time_diff_secs / 3600.0
-            
             old_ws_power = existing.get("last_ws_power", existing.get("power", 0) or 0)
                 
             p1 = float(raw.get("activePower", existing.get("power1", 0)) or 0)
             p2 = float(raw.get("activePower2", existing.get("power2", 0)) or 0)
             new_power_w = p1 + p2
 
-            # TRAPEZOIDAL INTEGRATOR: Average for the entire gap since the last REAL websocket event
-            calc_power_w = (old_ws_power + new_power_w) / 2.0
-
-            # --- GAP HANDLING LOGIC ---
-            gap_threshold_secs = 300
-            gap_mode = "skip"
-            if self.entry and self.entry.options:
-                gap_threshold_secs = self.entry.options.get(GAP_THRESHOLD, GAP_THRESHOLD_DEFAULT) * 60
-                gap_mode = self.entry.options.get(GAP_HANDLING, GAP_HANDLING_DEFAULT)
-                
-            is_v1 = self._panel_type.get(existing.get("panel_id")) == "LDATA"
-
-            time_since_tick = now - existing.get("last_power_time", now)
-            was_offline = time_since_tick > 60
-
-            if time_diff_secs > gap_threshold_secs and is_v1 and was_offline:
-                if gap_mode == GAP_HANDLING_SKIP:
-                    time_diff_hours = 0.0
-                elif gap_mode == GAP_HANDLING_EXTRAPOLATE:
-                    calc_power_w = old_ws_power
+            time_diff_hours, calc_power_w = self._resolve_gap_correction(
+                existing,
+                now,
+                float(old_ws_power),
+                new_power_w,
+            )
             
             existing["drift_accumulator_consumption"] = max(0.0, existing.get("drift_accumulator_consumption", 0.0) - existing.get("speculative_kwh_consumption", 0.0))
             existing["drift_accumulator_import"] = max(0.0, existing.get("drift_accumulator_import", 0.0) - existing.get("speculative_kwh_import", 0.0))

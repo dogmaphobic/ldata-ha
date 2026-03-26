@@ -54,6 +54,7 @@ SERVICE_RESET_ENERGY_SCHEMA = {
 COUNTER_DROP_MIN_DELTA_KWH = 0.1
 COUNTER_DROP_CONFIRMATIONS = 5
 COUNTER_DROP_TOLERANCE_KWH = 0.01
+ENERGY_RUNTIME_VERSION = 2
 
 
 def _resolved_energy_key(coordinator: LDATAUpdateCoordinator, panel_id: str | None, key: str) -> str:
@@ -299,6 +300,8 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
                     self._last_date = None
             if "energy_key" in attrs:
                 self._energy_key = attrs["energy_key"]
+            if attrs.get("energy_runtime_version") != ENERGY_RUNTIME_VERSION:
+                self._force_rebaseline_from_restore = True
             if not self.panel_total and attrs.get("energy_source") != _breaker_daily_energy_source():
                 # A restored baseline from a different counter family is stale by
                 # definition. Drop it and let the current estimate establish a
@@ -326,6 +329,7 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
         attributes["last_date"] = self._last_date.isoformat() if self._last_date else None
         attributes["energy_key"] = self._energy_key
         attributes["panel_energy_key"] = self._panel_energy_key
+        attributes["energy_runtime_version"] = ENERGY_RUNTIME_VERSION
         if self.panel_total:
             attributes["energy_source"] = "hardware" if self._uses_hardware_counters() else "estimated"
         else:
@@ -494,6 +498,13 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
                 except (ValueError, TypeError):
                     pass
 
+        if self._force_rebaseline_from_restore:
+            self._clear_pending_drop()
+            self._midnight_baseline = current_lifetime_sum
+            self._state = 0.0
+            self._force_rebaseline_from_restore = False
+            return
+
         if is_new_day or self._midnight_baseline is None:
             self._clear_pending_drop()
             self._midnight_baseline = current_lifetime_sum
@@ -534,6 +545,7 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
         self._last_date: datetime.date | None = None
         self._pending_drop_value: float | None = None
         self._pending_drop_count = 0
+        self._force_rebaseline_from_restore = False
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(self.coordinator.async_add_listener(self._state_update))
@@ -553,6 +565,8 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
                     self._last_date = datetime.date.fromisoformat(date_str)
                 except (ValueError, TypeError):
                     self._last_date = None
+            if attrs.get("energy_runtime_version") != ENERGY_RUNTIME_VERSION:
+                self._force_rebaseline_from_restore = True
         if self.coordinator.data:
             self._state_update()
 
@@ -590,6 +604,7 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
         attributes = super().extra_state_attributes
         attributes["midnight_baseline"] = self._midnight_baseline
         attributes["last_date"] = self._last_date.isoformat() if self._last_date else None
+        attributes["energy_runtime_version"] = ENERGY_RUNTIME_VERSION
         attributes["energy_source"] = "hardware" if self._uses_hardware_counters() else "estimated"
         return attributes
 
@@ -645,7 +660,12 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
             
             consumption = self._get_ct_consumption()
             if consumption is not None:
-                if is_new_day or self._midnight_baseline is None:
+                if self._force_rebaseline_from_restore:
+                    self._clear_pending_drop()
+                    self._midnight_baseline = consumption
+                    self._state = 0.0
+                    self._force_rebaseline_from_restore = False
+                elif is_new_day or self._midnight_baseline is None:
                     self._clear_pending_drop()
                     self._midnight_baseline = consumption
                     self._state = 0.0
