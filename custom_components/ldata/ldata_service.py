@@ -100,6 +100,36 @@ class LDATAService:
         data["last_ws_event_time"] = now
         data["last_ws_power"] = runtime_power
 
+    def _restore_breaker_software_counters(self, data: dict, old_data: dict | None) -> None:
+        """Restore breaker-only software lifetime counters.
+
+        Breaker hardware energy totals have proven inconsistent across panels
+        and update paths. Keep a persisted software lifetime counter for
+        breaker daily estimation so daily sensors are driven by integrated power,
+        not by whichever raw hardware lifetime base arrived most recently.
+        """
+        raw_consumption = self._hardware_energy_total(data, "consumption")
+        raw_import = self._hardware_energy_total(data, "import")
+
+        if old_data:
+            data["software_consumption"] = float(
+                old_data.get(
+                    "software_consumption",
+                    old_data.get("estimated_consumption", raw_consumption),
+                )
+                or 0.0
+            )
+            data["software_import"] = float(
+                old_data.get(
+                    "software_import",
+                    old_data.get("estimated_import", raw_import),
+                )
+                or 0.0
+            )
+        else:
+            data["software_consumption"] = raw_consumption
+            data["software_import"] = raw_import
+
     def _resolve_gap_correction(
         self,
         existing: dict,
@@ -431,6 +461,7 @@ class LDATAService:
                         else:
                             breaker_data["effective_consumption"] = 0.0
                             breaker_data["effective_import"] = 0.0
+                        self._restore_breaker_software_counters(breaker_data, old_brk)
                         self._restore_runtime_integrator_state(
                             breaker_data,
                             old_brk,
@@ -511,6 +542,12 @@ class LDATAService:
         data["estimated_import"] = base_import + float(data.get("drift_accumulator_import", 0.0) or 0.0)
 
         if "position" in data:
+            # Breaker daily sensors use a dedicated software lifetime counter so
+            # they are not reset or jumped by inconsistent raw breaker hardware
+            # totals. The drift accumulator is still kept for debugging and for
+            # historical continuity with prior persisted state.
+            data["estimated_consumption"] = float(data.get("software_consumption", data["estimated_consumption"]) or 0.0)
+            data["estimated_import"] = float(data.get("software_import", data["estimated_import"]) or 0.0)
             if data.get("has_hw_counters"):
                 data["effective_consumption"] = self._stable_breaker_energy_total(
                     data,
@@ -550,12 +587,14 @@ class LDATAService:
                 added = kw * time_diff_hours
                 b_data["drift_accumulator_consumption"] = b_data.get("drift_accumulator_consumption", 0.0) + added
                 b_data["speculative_kwh_consumption"] = b_data.get("speculative_kwh_consumption", 0.0) + added
+                b_data["software_consumption"] = b_data.get("software_consumption", b_data.get("estimated_consumption", 0.0)) + added
                 device_updated = True
             elif power_w < 0:
                 kw = abs(power_w) / 1000.0
                 added = kw * time_diff_hours
                 b_data["drift_accumulator_import"] = b_data.get("drift_accumulator_import", 0.0) + added
                 b_data["speculative_kwh_import"] = b_data.get("speculative_kwh_import", 0.0) + added
+                b_data["software_import"] = b_data.get("software_import", b_data.get("estimated_import", 0.0)) + added
                 device_updated = True
                 
             if device_updated:
@@ -618,6 +657,8 @@ class LDATAService:
             # 1. UNDO the speculative Left sums added by the continuous tick
             existing["drift_accumulator_consumption"] = max(0.0, existing.get("drift_accumulator_consumption", 0.0) - existing.get("speculative_kwh_consumption", 0.0))
             existing["drift_accumulator_import"] = max(0.0, existing.get("drift_accumulator_import", 0.0) - existing.get("speculative_kwh_import", 0.0))
+            existing["software_consumption"] = max(0.0, existing.get("software_consumption", existing.get("estimated_consumption", 0.0)) - existing.get("speculative_kwh_consumption", 0.0))
+            existing["software_import"] = max(0.0, existing.get("software_import", existing.get("estimated_import", 0.0)) - existing.get("speculative_kwh_import", 0.0))
 
             existing["speculative_kwh_consumption"] = 0.0
             existing["speculative_kwh_import"] = 0.0
@@ -626,9 +667,11 @@ class LDATAService:
             if calc_power_w > 0 and time_diff_hours > 0:
                 kw = calc_power_w / 1000.0
                 existing["drift_accumulator_consumption"] += (kw * time_diff_hours)
+                existing["software_consumption"] += (kw * time_diff_hours)
             elif calc_power_w < 0 and time_diff_hours > 0:
                 kw = abs(calc_power_w) / 1000.0
                 existing["drift_accumulator_import"] += (kw * time_diff_hours)
+                existing["software_import"] += (kw * time_diff_hours)
                 
         existing["last_power_time"] = now
         existing["last_ws_event_time"] = now
