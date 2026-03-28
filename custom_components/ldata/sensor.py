@@ -54,11 +54,12 @@ SERVICE_RESET_ENERGY_SCHEMA = {
 COUNTER_DROP_MIN_DELTA_KWH = 0.1
 COUNTER_DROP_CONFIRMATIONS = 5
 COUNTER_DROP_TOLERANCE_KWH = 0.01
-# Bump whenever the persisted daily-baseline semantics change. Version 3
-# switches breaker daily sensors to a breaker-only software lifetime counter
-# so restored baselines from the prior raw-hardware-backed estimate are
+# Bump whenever the persisted daily-baseline semantics change. Version 4 keeps
+# breaker daily sensors on the breaker-only software lifetime counter, but now
+# that counter is forward-only and no longer oscillates downward when websocket
+# corrections arrive. Restored baselines from the old reversible estimate are
 # intentionally discarded once on startup.
-ENERGY_RUNTIME_VERSION = 3
+ENERGY_RUNTIME_VERSION = 4
 
 
 def _resolved_energy_key(coordinator: LDATAUpdateCoordinator, panel_id: str | None, key: str) -> str:

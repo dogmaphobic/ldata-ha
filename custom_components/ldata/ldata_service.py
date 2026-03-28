@@ -587,6 +587,10 @@ class LDATAService:
                 added = kw * time_diff_hours
                 b_data["drift_accumulator_consumption"] = b_data.get("drift_accumulator_consumption", 0.0) + added
                 b_data["speculative_kwh_consumption"] = b_data.get("speculative_kwh_consumption", 0.0) + added
+                # Breaker daily sensors require a monotonic source. Keep the
+                # breaker-only software lifetime counter as a pure forward-only
+                # integral of breaker power rather than a reversible correction
+                # buffer like drift_accumulator_consumption.
                 b_data["software_consumption"] = b_data.get("software_consumption", b_data.get("estimated_consumption", 0.0)) + added
                 device_updated = True
             elif power_w < 0:
@@ -657,9 +661,6 @@ class LDATAService:
             # 1. UNDO the speculative Left sums added by the continuous tick
             existing["drift_accumulator_consumption"] = max(0.0, existing.get("drift_accumulator_consumption", 0.0) - existing.get("speculative_kwh_consumption", 0.0))
             existing["drift_accumulator_import"] = max(0.0, existing.get("drift_accumulator_import", 0.0) - existing.get("speculative_kwh_import", 0.0))
-            existing["software_consumption"] = max(0.0, existing.get("software_consumption", existing.get("estimated_consumption", 0.0)) - existing.get("speculative_kwh_consumption", 0.0))
-            existing["software_import"] = max(0.0, existing.get("software_import", existing.get("estimated_import", 0.0)) - existing.get("speculative_kwh_import", 0.0))
-
             existing["speculative_kwh_consumption"] = 0.0
             existing["speculative_kwh_import"] = 0.0
             
@@ -667,11 +668,9 @@ class LDATAService:
             if calc_power_w > 0 and time_diff_hours > 0:
                 kw = calc_power_w / 1000.0
                 existing["drift_accumulator_consumption"] += (kw * time_diff_hours)
-                existing["software_consumption"] += (kw * time_diff_hours)
             elif calc_power_w < 0 and time_diff_hours > 0:
                 kw = abs(calc_power_w) / 1000.0
                 existing["drift_accumulator_import"] += (kw * time_diff_hours)
-                existing["software_import"] += (kw * time_diff_hours)
                 
         existing["last_power_time"] = now
         existing["last_ws_event_time"] = now
