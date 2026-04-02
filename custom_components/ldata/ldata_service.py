@@ -643,13 +643,32 @@ class LDATAService:
         """Apply a raw breaker update (from WS or REST) to the existing cached breaker dict."""
         
         now = time.time()
+
+        def _field(key, cached):
+            if key in raw and raw[key] is not None:
+                return float(raw[key])
+            return cached
+
+        cached_p1 = existing.get("power1") or 0
+        cached_p2 = existing.get("power2") or 0
+        leg = existing.get("leg", 1)
+        has_power_field = "power" in raw or "power2" in raw
+
+        # Normalize the live breaker power onto its actual leg before using it
+        # for websocket correction math. Otherwise a single-pole leg-2 breaker
+        # can accidentally carry a stale opposite-leg cached value inside
+        # last_ws_power even though the published breaker power looks correct.
+        if leg == 1:
+            p1 = _field("power", cached_p1)
+            p2 = _field("power2", cached_p2)
+        else:
+            p2 = _field("power", cached_p2)
+            p1 = _field("power2", cached_p1)
+        new_power_w = (p1 + p2) if has_power_field else float(existing.get("power", 0) or 0)
+
         last_ws_time = existing.get("last_ws_event_time")
         if last_ws_time:
             old_ws_power = existing.get("last_ws_power", existing.get("power", 0) or 0)
-                
-            p1 = float(raw.get("power", existing.get("power1", 0)) or 0)
-            p2 = float(raw.get("power2", existing.get("power2", 0)) or 0)
-            new_power_w = p1 + p2
 
             time_diff_hours, calc_power_w = self._resolve_gap_correction(
                 existing,
@@ -674,25 +693,8 @@ class LDATAService:
                 
         existing["last_power_time"] = now
         existing["last_ws_event_time"] = now
-        
-        p1 = float(raw.get("power", existing.get("power1", 0)) or 0)
-        p2 = float(raw.get("power2", existing.get("power2", 0)) or 0)
-        existing["last_ws_power"] = p1 + p2
 
-        def _field(key, cached):
-            if key in raw and raw[key] is not None: return float(raw[key])
-            return cached
-
-        cached_p1 = existing.get("power1") or 0
-        cached_p2 = existing.get("power2") or 0
-        leg = existing.get("leg", 1)
-        
-        if leg == 1:
-            p1 = _field("power", cached_p1)
-            p2 = _field("power2", cached_p2)
-        else:
-            p2 = _field("power", cached_p2)
-            p1 = _field("power2", cached_p1)
+        existing["last_ws_power"] = new_power_w
         
         cached_c1 = existing.get("current1") or 0
         cached_c2 = existing.get("current2") or 0
@@ -703,12 +705,11 @@ class LDATAService:
             c2 = _field("rmsCurrent", cached_c2)
             c1 = _field("rmsCurrent2", cached_c1)
         
-        has_power_field = "power" in raw or "power2" in raw
         has_current_field = "rmsCurrent" in raw or "rmsCurrent2" in raw
         has_voltage_field = "rmsVoltage" in raw or "rmsVoltage2" in raw
         has_frequency_field = "lineFrequency" in raw or "lineFrequency2" in raw
         
-        cand_power = (p1 + p2) if has_power_field else (existing.get("power") or 0)
+        cand_power = new_power_w if has_power_field else (existing.get("power") or 0)
         poles = existing.get("poles", 1)
         cand_current = ((c1 + c2) / 2 if poles == 2 else c1 + c2) if has_current_field else (existing.get("current") or 0)
         
