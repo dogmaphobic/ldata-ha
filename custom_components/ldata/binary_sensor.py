@@ -46,6 +46,9 @@ class LDATABinarySensor(LDATAEntity, BinarySensorEntity):
     """LDATA binary sensor class."""
 
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    # These status/problem helpers are still useful for troubleshooting, but
+    # they add a lot of noise for the default Home Assistant entity list.
+    _attr_entity_registry_visible_default = False
 
     def __init__(self, coordinator, data) -> None:
         """Init LDATABinarySensor."""
@@ -118,6 +121,7 @@ class LDATACloudConnectedSensor(LDATAEntity, BinarySensorEntity):
     """LDATA Cloud Connection binary sensor for a specific panel."""
 
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_visible_default = False
 
     def __init__(self, coordinator, data) -> None:
         """Init LDATACloudConnectedSensor."""
@@ -182,6 +186,7 @@ class LDATAPanelOverVoltageSensor(LDATAEntity, BinarySensorEntity):
 
     _attr_device_class = BinarySensorDeviceClass.PROBLEM
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_visible_default = False
 
     def __init__(self, coordinator, data) -> None:
         """Init sensor."""
@@ -237,6 +242,7 @@ class LDATAPanelUnderVoltageSensor(LDATAEntity, BinarySensorEntity):
 
     _attr_device_class = BinarySensorDeviceClass.PROBLEM
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_visible_default = False
 
     def __init__(self, coordinator, data) -> None:
         """Init sensor."""
@@ -295,6 +301,7 @@ class LDATABreakerOverCurrentSensor(LDATAEntity, BinarySensorEntity):
 
     _attr_device_class = BinarySensorDeviceClass.PROBLEM
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_visible_default = False
 
     def __init__(self, coordinator, data) -> None:
         """Init sensor."""
@@ -340,6 +347,7 @@ class LDATABreakerUnderVoltageSensor(LDATAEntity, BinarySensorEntity):
 
     _attr_device_class = BinarySensorDeviceClass.PROBLEM
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_visible_default = False
 
     def __init__(self, coordinator, data) -> None:
         """Init sensor."""

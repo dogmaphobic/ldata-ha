@@ -124,6 +124,8 @@ class SensorDescription(SensorEntityDescription):
     name: str | None = None
 
 
+# Keep the diagnostic/low-value entities available for power users without
+# cluttering the default entity list on a fresh install.
 SENSOR_TYPES = (
     SensorDescription(  # index=0
         device_class=SensorDeviceClass.POWER,
@@ -136,6 +138,7 @@ SENSOR_TYPES = (
     SensorDescription(  # index=1
         device_class=SensorDeviceClass.VOLTAGE,
         state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_visible_default=False,
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
         name="Volts",
         key="voltage",
@@ -144,6 +147,7 @@ SENSOR_TYPES = (
     SensorDescription(  # index=2
         device_class=SensorDeviceClass.CURRENT,
         state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_visible_default=False,
         native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
         name="Amps",
         key="current",
@@ -152,6 +156,7 @@ SENSOR_TYPES = (
     SensorDescription(  # index=3
         device_class=SensorDeviceClass.FREQUENCY,
         state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_visible_default=False,
         native_unit_of_measurement=UnitOfFrequency.HERTZ,
         name="Frequency",
         key="frequency",
@@ -160,6 +165,7 @@ SENSOR_TYPES = (
     SensorDescription(  # index=4
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_registry_visible_default=False,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         name="Import",
         key="import",
@@ -274,6 +280,10 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
         self.panel_total = panelTotal
         self._panel_energy_key: str = panel_energy_key
         self._breaker_energy_key: str | None = breaker_energy_key
+        if panel_energy_key == "import" or breaker_energy_key == "import":
+            # Daily import is only useful on solar/export setups, so hide it by
+            # default and let advanced users opt in from the registry.
+            self._attr_entity_registry_visible_default = False
         super().__init__(data=data, coordinator=coordinator)
         self.breaker_data = data
         self._state: float | None = None
@@ -543,6 +553,10 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
 
     def __init__(self, coordinator: LDATAUpdateCoordinator, data, panelTotal, which_panel: str, energy_key: str = "consumption") -> None:
         self._energy_key: str = energy_key
+        if energy_key == "import":
+            # CT daily import follows the same pattern as breaker daily import:
+            # keep it available, but do not surface it in the default UI.
+            self._attr_entity_registry_visible_default = False
         super().__init__(data=data, coordinator=coordinator)
         self.breaker_data = data
         self._state: float | None = None
@@ -1121,6 +1135,7 @@ class LDATABreakerBleRSSISensor(LDATAEntity, SensorEntity):
 
 class LDATAPanelWifiRSSISensor(LDATAEntity, SensorEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_visible_default = False
     _attr_native_unit_of_measurement = "dBm"
     _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
 
