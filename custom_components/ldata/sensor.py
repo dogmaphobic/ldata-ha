@@ -63,10 +63,22 @@ ENERGY_RUNTIME_VERSION = 4
 
 
 def _resolved_energy_key(coordinator: LDATAUpdateCoordinator, panel_id: str | None, key: str) -> str:
-    """Prefer raw hardware counters when the panel exposes them."""
+    """Prefer stable hardware-backed totals when the panel exposes counters.
+
+    Raw CT/panel lifetime counters can regress for several consecutive updates.
+    The service layer now maintains effective_* totals that preserve hardware
+    true-ups but do not let those regressions collapse daily sensors mid-day.
+    """
     if panel_id and coordinator.service.panel_has_hw_counters(panel_id):
-        return key
+        return f"effective_{key}"
     return f"estimated_{key}"
+
+
+def _panel_energy_source(coordinator: LDATAUpdateCoordinator, panel_id: str | None) -> str:
+    """Describe which counter family drives panel and CT daily entities."""
+    if panel_id and coordinator.service.panel_has_hw_counters(panel_id):
+        return "hardware_guarded"
+    return "estimated"
 
 
 def _resolved_breaker_energy_key(breaker_data: dict[str, Any], key: str) -> str:
@@ -317,7 +329,12 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
                 self._energy_key = attrs["energy_key"]
             if attrs.get("energy_runtime_version") != ENERGY_RUNTIME_VERSION:
                 self._force_rebaseline_from_restore = True
-            if not self.panel_total and attrs.get("energy_source") != _breaker_daily_energy_source():
+            expected_source = (
+                _panel_energy_source(self.coordinator, self._energy_panel_id())
+                if self.panel_total
+                else _breaker_daily_energy_source()
+            )
+            if attrs.get("energy_source") != expected_source:
                 # A restored baseline from a different counter family is stale by
                 # definition. Drop it and let the current estimate establish a
                 # fresh baseline on the first coordinator update.
@@ -346,7 +363,10 @@ class LDATADailyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
         attributes["panel_energy_key"] = self._panel_energy_key
         attributes["energy_runtime_version"] = ENERGY_RUNTIME_VERSION
         if self.panel_total:
-            attributes["energy_source"] = "hardware" if self._uses_hardware_counters() else "estimated"
+            attributes["energy_source"] = _panel_energy_source(
+                self.coordinator,
+                self._energy_panel_id(),
+            )
         else:
             attributes["energy_source"] = _breaker_daily_energy_source()
         return attributes
@@ -586,6 +606,12 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
                     self._last_date = None
             if attrs.get("energy_runtime_version") != ENERGY_RUNTIME_VERSION:
                 self._force_rebaseline_from_restore = True
+            expected_source = _panel_energy_source(
+                self.coordinator,
+                self.breaker_data.get("panel_id"),
+            )
+            if attrs.get("energy_source") != expected_source:
+                self._force_rebaseline_from_restore = True
         if self.coordinator.data:
             self._state_update()
 
@@ -624,7 +650,10 @@ class LDATACTDailyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
         attributes["midnight_baseline"] = self._midnight_baseline
         attributes["last_date"] = self._last_date.isoformat() if self._last_date else None
         attributes["energy_runtime_version"] = ENERGY_RUNTIME_VERSION
-        attributes["energy_source"] = "hardware" if self._uses_hardware_counters() else "estimated"
+        attributes["energy_source"] = _panel_energy_source(
+            self.coordinator,
+            self.breaker_data.get("panel_id"),
+        )
         return attributes
 
     def _uses_hardware_counters(self) -> bool:

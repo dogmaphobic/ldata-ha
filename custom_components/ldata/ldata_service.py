@@ -130,6 +130,48 @@ class LDATAService:
             data["software_consumption"] = raw_consumption
             data["software_import"] = raw_import
 
+    def _restore_ct_software_counters(self, data: dict, old_data: dict | None) -> None:
+        """Restore CT software counters used to stabilize panel lifetime totals.
+
+        Panel daily entities are built from CT lifetime counters when panel CTs
+        exist. Those raw CT lifetime counters can also regress for several
+        consecutive updates, so keep a CT-local forward-only software lifetime
+        counter that is seeded from the best persisted value available.
+        """
+        raw_consumption = self._hardware_energy_total(data, "consumption")
+        raw_import = self._hardware_energy_total(data, "import")
+
+        if old_data:
+            restored_consumption = float(
+                old_data.get(
+                    "software_consumption",
+                    old_data.get(
+                        "effective_consumption",
+                        old_data.get("estimated_consumption", raw_consumption),
+                    ),
+                )
+                or 0.0
+            )
+            restored_import = float(
+                old_data.get(
+                    "software_import",
+                    old_data.get(
+                        "effective_import",
+                        old_data.get("estimated_import", raw_import),
+                    ),
+                )
+                or 0.0
+            )
+        else:
+            restored_consumption = raw_consumption
+            restored_import = raw_import
+
+        # Never restore a CT software lifetime below the current hardware base.
+        # If HA was offline, the hardware counter may have legitimately advanced
+        # further than the last persisted software estimate.
+        data["software_consumption"] = max(restored_consumption, raw_consumption)
+        data["software_import"] = max(restored_import, raw_import)
+
     def _resolve_gap_correction(
         self,
         existing: dict,
@@ -366,6 +408,7 @@ class LDATAService:
                         
                         # --- DISK PERSISTENCE MERGE FOR CTS ---
                         old_ct = existing_cts.get(ct_data["id"])
+                        self._restore_ct_software_counters(ct_data, old_ct)
                         self._restore_runtime_integrator_state(
                             ct_data,
                             old_ct,
@@ -562,6 +605,26 @@ class LDATAService:
             else:
                 data["effective_consumption"] = data["estimated_consumption"]
                 data["effective_import"] = data["estimated_import"]
+        elif "channel" in data:
+            # CT/panel hardware counters can also regress. Keep a CT-local
+            # software lifetime counter driven by observed power and catch it up
+            # to the raw hardware base whenever the hardware is ahead.
+            data["software_consumption"] = max(
+                float(data.get("software_consumption", data["estimated_consumption"]) or 0.0),
+                base_consumption,
+            )
+            data["software_import"] = max(
+                float(data.get("software_import", data["estimated_import"]) or 0.0),
+                base_import,
+            )
+            data["effective_consumption"] = max(
+                base_consumption,
+                float(data.get("software_consumption", 0.0) or 0.0),
+            )
+            data["effective_import"] = max(
+                base_import,
+                float(data.get("software_import", 0.0) or 0.0),
+            )
 
     def advance_all_drift(self):
         """Continuously update the Riemann sums for all active breakers and CTs."""
@@ -623,12 +686,20 @@ class LDATAService:
                 added = kw * time_diff_hours
                 ct_data["drift_accumulator_consumption"] = ct_data.get("drift_accumulator_consumption", 0.0) + added
                 ct_data["speculative_kwh_consumption"] = ct_data.get("speculative_kwh_consumption", 0.0) + added
+                ct_data["software_consumption"] = ct_data.get(
+                    "software_consumption",
+                    ct_data.get("effective_consumption", ct_data.get("estimated_consumption", 0.0)),
+                ) + added
                 device_updated = True
             elif power_w < 0:
                 kw = abs(power_w) / 1000.0
                 added = kw * time_diff_hours
                 ct_data["drift_accumulator_import"] = ct_data.get("drift_accumulator_import", 0.0) + added
                 ct_data["speculative_kwh_import"] = ct_data.get("speculative_kwh_import", 0.0) + added
+                ct_data["software_import"] = ct_data.get(
+                    "software_import",
+                    ct_data.get("effective_import", ct_data.get("estimated_import", 0.0)),
+                ) + added
                 device_updated = True
                 
             if device_updated:
@@ -913,6 +984,15 @@ class LDATAService:
                 current_drift = existing.get("drift_accumulator_import", 0.0)
                 existing["drift_accumulator_import"] = max(0.0, current_drift - hardware_delta)
                 _LOGGER.info("[Energy Sync] Leviton hardware confirmed %.3f kWh imported. Reduced software drift from %.3f to %.3f", hardware_delta, current_drift, existing["drift_accumulator_import"])
+
+        existing["software_consumption"] = max(
+            float(existing.get("software_consumption", existing.get("estimated_consumption", 0.0)) or 0.0),
+            self._hardware_energy_total(existing, "consumption"),
+        )
+        existing["software_import"] = max(
+            float(existing.get("software_import", existing.get("estimated_import", 0.0)) or 0.0),
+            self._hardware_energy_total(existing, "import"),
+        )
             
         self._sync_energy_totals(existing)
         
