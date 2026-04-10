@@ -904,7 +904,14 @@ class LDATABreakerEnergyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
                 if new_data := breakers.get(self.breaker_data["id"]):
                     raw = new_data.get(_resolved_breaker_energy_key(new_data, self.entity_description.key))
                     if raw is not None:
-                        self._state = float(raw)
+                        next_state = float(raw)
+                        if self._state is None:
+                            self._state = next_state
+                        else:
+                            # Breaker lifetime energy is expected to be monotonic.
+                            # Clamp any transient regression so recorder/statistics
+                            # do not see a decrease from restore or stale payloads.
+                            self._state = max(self._state, next_state)
         except (KeyError, ValueError, TypeError):
             pass
         self.async_write_ha_state()
@@ -1059,7 +1066,16 @@ class LDATAEnergyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
                         )
                     )
                     if raw is not None:
-                        self._state = float(raw)
+                        next_state = float(raw)
+                        if self._state is None:
+                            self._state = next_state
+                        else:
+                            # CT lifetime energy must remain monotonic from Home
+                            # Assistant's point of view. The service layer already
+                            # guards the underlying counter families, but clamp the
+                            # published entity too so tiny restore/reconnect
+                            # regressions do not poison statistics.
+                            self._state = max(self._state, next_state)
         except (KeyError, ValueError, TypeError):
             pass
         self.async_write_ha_state()
