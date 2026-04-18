@@ -35,3 +35,24 @@ reset_energy_baseline:
           max: 10000000
           step: 0.001
           mode: box
+
+reset_panel_energy:
+  name: Reset all panel energy sensors
+  description: >-
+    Reset all live LDATA energy sensors associated with one panel device.
+    This clears daily baselines and unlatches cached lifetime energy values
+    so the next coordinator update can accept fresh hardware readings.
+  target:
+    device:
+      integration: ldata
+  fields:
+    device_id:
+      name: Panel device
+      description: >-
+        Select the panel device itself, or any breaker / CT that belongs to
+        that panel. The integration will resolve the parent panel and reset
+        every associated energy sensor.
+      required: true
+      selector:
+        device:
+          integration: ldata

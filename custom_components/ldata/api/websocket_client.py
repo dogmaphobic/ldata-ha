@@ -299,10 +299,10 @@ class LDATAWebsocketClient:
             reconnect_delay = min(reconnect_delay * 2, max_delay)
 
     async def _apiversion_heartbeat(self, session: aiohttp.ClientSession):
-        """Send apiversion GET to keep server-side session warm."""
-        try: 
+        """Send apiversion GET to keep server-side session warm and track changes."""
+        try:
             async with session.get(
-                "https://my.leviton.com/apiversion", 
+                "https://my.leviton.com/apiversion",
                 headers={
                     "Authorization": self.http.auth_token,
                     "Origin": "https://myapp.leviton.com",
@@ -311,5 +311,41 @@ class LDATAWebsocketClient:
                 },
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
-                _LOGGER.debug("[v%s] API version heartbeat: %s", self.service.version, resp.status)
-        except Exception: pass
+                if resp.status != 200:
+                    _LOGGER.debug(
+                        "[v%s] API version heartbeat: non-200 response (%s) — skipping",
+                        self.service.version,
+                        resp.status,
+                    )
+                    return
+
+                api_ver = (await resp.text()).strip()
+                ver_valid = bool(api_ver and api_ver.replace(".", "").isdigit())
+                if not ver_valid:
+                    _LOGGER.debug(
+                        "[v%s] API version heartbeat: unexpected body ignored (%r)",
+                        self.service.version,
+                        api_ver[:40],
+                    )
+                    return
+
+                current_api_version = getattr(self.service, "_leviton_api_version", None)
+
+                if current_api_version is None:
+                    self.service._leviton_api_version = api_ver
+                    _LOGGER.debug("[v%s] Leviton API version: %s", self.service.version, api_ver)
+                elif api_ver != current_api_version:
+                    _LOGGER.warning(
+                        "[v%s] Leviton API version changed: %s -> %s. "
+                        "New fields or endpoints may be available.",
+                        self.service.version,
+                        current_api_version,
+                        api_ver,
+                    )
+                    self.service._leviton_api_version = api_ver
+                else:
+                    _LOGGER.debug("[v%s] API version heartbeat: %s", self.service.version, resp.status)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            _LOGGER.debug("[v%s] API version heartbeat failed: %s", self.service.version, ex)
