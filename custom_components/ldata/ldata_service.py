@@ -66,6 +66,10 @@ class LDATAService:
         # ── Energy counter monotonic protection ──────────────────────
         self._energy_decrease_count: dict[str, int] = {}
         self._ENERGY_DECREASE_ACCEPT_THRESHOLD = 5
+        # Stop integrating software energy from stale live power. If websocket
+        # updates disappear for too long, under-counting is preferable to
+        # integrating a bad high value for hours.
+        self._LIVE_POWER_STALE_TIMEOUT_SECS = 600
 
     def _restore_runtime_integrator_state(
         self,
@@ -536,10 +540,28 @@ class LDATAService:
             _LOGGER.debug("[v%s] Bandwidth toggle failed for %s: %s", self.version, panel_id, ex)
 
     def _guard_energy_counter(self, key: str, new_val: float, cached_val: float) -> float:
-        """Monotonic guard for a single energy counter field."""
+        """Monotonic guard for a single energy counter field.
+
+        CT hardware lifetime counters should never be treated as legitimately
+        decreasing. In practice, when they go backwards it has led to later
+        false "catch-up" jumps that poison downstream totals and utility meters.
+        Breaker hardware counters remain on the older multi-reading acceptance
+        path because they have historically been noisier and are not currently
+        driving the house-level stats-safe totals.
+        """
         if new_val >= cached_val:
             self._energy_decrease_count.pop(key, None)
             return new_val
+
+        if key.startswith("ct:"):
+            count = self._energy_decrease_count.get(key, 0) + 1
+            self._energy_decrease_count[key] = count
+            if count in (1, self._ENERGY_DECREASE_ACCEPT_THRESHOLD):
+                _LOGGER.warning(
+                    "[v%s] Ignoring CT energy counter decrease for %s (cached=%.3f, new=%.3f, count=%d)",
+                    self.version, key, cached_val, new_val, count
+                )
+            return cached_val
 
         count = self._energy_decrease_count.get(key, 0) + 1
         self._energy_decrease_count[key] = count
@@ -637,6 +659,13 @@ class LDATAService:
         for b_id, b_data in self.status_data.get("breakers", {}).items():
             last_time = b_data.get("last_power_time")
             if not last_time: continue
+
+            last_ws_time = float(b_data.get("last_ws_event_time") or last_time or now)
+            if now - last_ws_time > self._LIVE_POWER_STALE_TIMEOUT_SECS:
+                # Freeze the integrator clock while the live power reading is
+                # stale so a stuck breaker value cannot accrue phantom energy.
+                b_data["last_power_time"] = now
+                continue
             
             time_diff_secs = now - last_time
             if time_diff_secs < 1.0: continue
@@ -673,6 +702,14 @@ class LDATAService:
         for ct_id, ct_data in self.status_data.get("cts", {}).items():
             last_time = ct_data.get("last_power_time")
             if not last_time: continue
+
+            last_ws_time = float(ct_data.get("last_ws_event_time") or last_time or now)
+            if now - last_ws_time > self._LIVE_POWER_STALE_TIMEOUT_SECS:
+                # Apply the same stale-data protection to CT software
+                # integration. Hardware true-ups can still move the lifetime
+                # counters forward, but stale live power should not.
+                ct_data["last_power_time"] = now
+                continue
             
             time_diff_secs = now - last_time
             if time_diff_secs < 1.0: continue
@@ -961,7 +998,16 @@ class LDATAService:
                 hardware_delta = new_base_cons - old_base_cons
                 current_drift = existing.get("drift_accumulator_consumption", 0.0)
                 existing["drift_accumulator_consumption"] = max(0.0, current_drift - hardware_delta)
-                _LOGGER.info("[Energy Sync] Leviton hardware confirmed %.3f kWh consumed. Reduced software drift from %.3f to %.3f", hardware_delta, current_drift, existing["drift_accumulator_consumption"])
+                _LOGGER.info(
+                    "[Energy Sync] CT %s panel %s confirmed %.3f kWh consumed (base %.3f -> %.3f). Reduced software drift from %.3f to %.3f",
+                    ct_id,
+                    existing.get("panel_id", "?"),
+                    hardware_delta,
+                    old_base_cons,
+                    new_base_cons,
+                    current_drift,
+                    existing["drift_accumulator_consumption"],
+                )
 
         # IMPORT TRUE-UP
         if "energyImport" in raw or "energyImport2" in raw:
@@ -983,7 +1029,16 @@ class LDATAService:
                 hardware_delta = new_base_imp - old_base_imp
                 current_drift = existing.get("drift_accumulator_import", 0.0)
                 existing["drift_accumulator_import"] = max(0.0, current_drift - hardware_delta)
-                _LOGGER.info("[Energy Sync] Leviton hardware confirmed %.3f kWh imported. Reduced software drift from %.3f to %.3f", hardware_delta, current_drift, existing["drift_accumulator_import"])
+                _LOGGER.info(
+                    "[Energy Sync] CT %s panel %s confirmed %.3f kWh imported (base %.3f -> %.3f). Reduced software drift from %.3f to %.3f",
+                    ct_id,
+                    existing.get("panel_id", "?"),
+                    hardware_delta,
+                    old_base_imp,
+                    new_base_imp,
+                    current_drift,
+                    existing["drift_accumulator_import"],
+                )
 
         existing["software_consumption"] = max(
             float(existing.get("software_consumption", existing.get("estimated_consumption", 0.0)) or 0.0),
@@ -1154,6 +1209,7 @@ class LDATAService:
     async def _refresh_panel_data_locked(self) -> bool:
         new_status_data = self.status_data.copy()
         panels = new_status_data.get("panels", []).copy()
+        breakers = new_status_data.get("breakers", {}).copy()
         updated = False
 
         for i, panel_data in enumerate(panels):
@@ -1202,11 +1258,43 @@ class LDATAService:
                 panels[i] = panel
                 updated = True
 
+                raw_breakers = None
+                if panel_type == "WHEMS":
+                    raw_breakers = await self.http.get_Whems_breakers(panel_id)
+                elif raw.get("residentialBreakers"):
+                    raw_breakers = raw.get("residentialBreakers")
+
+                if raw_breakers:
+                    panels_with_power_change = set()
+                    breaker_updated = False
+                    for breaker_raw in raw_breakers:
+                        breaker_id = breaker_raw.get("id")
+                        if not breaker_id or breaker_id not in breakers:
+                            continue
+                        breaker = breakers[breaker_id].copy()
+                        power_changed = self._apply_breaker_update(
+                            breaker_id,
+                            breaker,
+                            breaker_raw,
+                            source="REST-panel",
+                        )
+                        breakers[breaker_id] = breaker
+                        breaker_updated = True
+                        if power_changed:
+                            panels_with_power_change.add(breaker.get("panel_id"))
+
+                    if breaker_updated:
+                        updated = True
+                        for pid in panels_with_power_change:
+                            if pid:
+                                self._recalc_total_power(new_status_data, pid)
+
             except Exception:
                 _LOGGER.debug("[v%s] Failed to refresh panel %s: ", self.version, panel_id, exc_info=True)
 
         if updated:
             new_status_data["panels"] = panels
+            new_status_data["breakers"] = breakers
             self.status_data = new_status_data
 
         return updated

@@ -28,6 +28,9 @@ STORAGE_VERSION = 1
 class LDATAUpdateCoordinator(DataUpdateCoordinator):
     """LDATAUpdateCoordinator to handle fetching new data about the LDATA module."""
 
+    _STORE_SAVE_QUIET_DELAY_SECS = 60
+    _STORE_SAVE_MAX_INTERVAL_SECS = 5 * 60
+
     def __init__(
         self, hass: HomeAssistant, user, password, entry
     ) -> None:
@@ -43,10 +46,13 @@ class LDATAUpdateCoordinator(DataUpdateCoordinator):
         self._debounce_timer = None
         self._websocket_connected = False
         self._websocket_ever_connected = False
+        self._startup_ct_refresh_done = False
         
         # Setup Home Assistant .storage Disk Persistence
         self._store = Store(hass, STORAGE_VERSION, f"{DOMAIN}_{entry.entry_id}_energy_data")
         self._disk_data_loaded = False
+        self._last_store_save_monotonic = hass.loop.time()
+        self._store_save_task: asyncio.Task | None = None
 
         # No polling interval — WebSocket + slow hourly sync handle updates
         super().__init__(
@@ -102,8 +108,15 @@ class LDATAUpdateCoordinator(DataUpdateCoordinator):
         
         # Force a hard drive save instantly upon shutdown
         if self._service.status_data:
-            await self._store.async_save(self._service.status_data)
-            _LOGGER.debug("Successfully saved LDATA accumulator persistence to disk on shutdown")
+            await self._async_persist_store("shutdown")
+
+        if self._store_save_task:
+            try:
+                await self._store_save_task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self._store_save_task = None
         
         if self._ct_poll_task:
             self._ct_poll_task.cancel()
@@ -160,9 +173,102 @@ class LDATAUpdateCoordinator(DataUpdateCoordinator):
                 _LOGGER.warning("[v%s] Slow poll error: %s", self._service.version, ex)
                 await asyncio.sleep(30)
 
+    async def _async_startup_ct_refresh(self) -> bool:
+        """Hydrate CT hardware counters before persisting initial startup state.
+
+        Some panels expose placeholder/partial CT lifetime counters in the
+        first startup snapshot and only return the real hardware totals after
+        an explicit CT refresh. If we save that early snapshot, we can poison
+        later restores and any downstream utility meters. Do one eager true-up
+        on startup before the first disk save.
+        """
+        if self._startup_ct_refresh_done:
+            return False
+        if not self._service.needs_ct_poll:
+            self._startup_ct_refresh_done = True
+            return False
+
+        refreshed = False
+        try:
+            _LOGGER.info(
+                "[v%s] Running startup CT true-up before initial state save",
+                self._service.version,
+            )
+            refreshed = await self._service.refresh_ct_data()
+            if refreshed:
+                _LOGGER.info(
+                    "[v%s] Startup CT true-up completed",
+                    self._service.version,
+                )
+            else:
+                _LOGGER.warning(
+                    "[v%s] Startup CT true-up did not refresh any CT data",
+                    self._service.version,
+                )
+        except LDATAAuthError as ex:
+            _LOGGER.warning(
+                "[v%s] Startup CT true-up auth error: %s",
+                self._service.version,
+                ex,
+            )
+        except Exception as ex:
+            _LOGGER.warning(
+                "[v%s] Startup CT true-up failed: %s",
+                self._service.version,
+                ex,
+            )
+        finally:
+            self._startup_ct_refresh_done = True
+
+        return refreshed
+
     def _get_stored_data(self):
         """Helper function for the delayed disk save."""
         return self._service.status_data
+
+    async def _async_persist_store(self, reason: str) -> None:
+        """Write the current runtime state to disk immediately."""
+        data = self._service.status_data
+        if not data:
+            return
+
+        await self._store.async_save(data)
+        self._last_store_save_monotonic = self._hass.loop.time()
+        _LOGGER.debug(
+            "[v%s] Persisted LDATA accumulator state to disk (%s)",
+            self._service.version,
+            reason,
+        )
+
+    async def _async_periodic_store_flush(self, reason: str) -> None:
+        """Background wrapper for a bounded periodic persistence flush."""
+        try:
+            await self._async_persist_store(reason)
+        except Exception as ex:
+            _LOGGER.warning(
+                "[v%s] Failed to persist LDATA accumulator state (%s): %s",
+                self._service.version,
+                reason,
+                ex,
+            )
+        finally:
+            self._store_save_task = None
+
+    def _queue_store_save(self) -> None:
+        """Save soon, but never let live traffic postpone writes indefinitely."""
+        now = self._hass.loop.time()
+        elapsed = now - self._last_store_save_monotonic
+
+        if elapsed >= self._STORE_SAVE_MAX_INTERVAL_SECS:
+            if self._store_save_task is None or self._store_save_task.done():
+                self._store_save_task = self.config_entry.async_create_background_task(
+                    self._hass,
+                    self._async_periodic_store_flush("max_interval"),
+                    "ldata_store_flush",
+                )
+            return
+
+        self._store.async_delay_save(self._get_stored_data, self._STORE_SAVE_QUIET_DELAY_SECS)
 
     def _handle_websocket_update(self, source="Scheduled/REST"):
         if self._debounce_timer is None:
@@ -190,8 +296,10 @@ class LDATAUpdateCoordinator(DataUpdateCoordinator):
             self._log_data_if_enabled(data, source)
             self.async_set_updated_data(data)
             
-            # TRIGGER DISK SAVE: Write the memory state to hard drive automatically (debounced 60s)
-            self._store.async_delay_save(self._get_stored_data, 60)
+            # Keep the normal quiet-delay save, but cap the maximum interval
+            # between real disk writes so a busy websocket loop cannot defer
+            # persistence forever.
+            self._queue_store_save()
         
         except Exception as e:
             _LOGGER.error("[v%s] Error in debounced update: %s", self._service.version, e)
@@ -275,9 +383,26 @@ class LDATAUpdateCoordinator(DataUpdateCoordinator):
         try:
             async with asyncio.timeout(30):
                 returnData = await self._service.status()
-                
+
+            startup_ct_attempted = False
+            startup_ct_refreshed = False
             if returnData:
-                self._store.async_delay_save(self._get_stored_data, 1)
+                startup_ct_attempted = self._service.needs_ct_poll
+                startup_ct_refreshed = await self._async_startup_ct_refresh()
+                if startup_ct_refreshed and self._service.status_data:
+                    returnData = self._service.status_data
+
+                # Only persist the initial snapshot when the eager CT true-up
+                # either succeeded or was not needed. Otherwise a placeholder
+                # startup CT baseline can overwrite a good persisted lifetime
+                # total and make the next restart worse.
+                if startup_ct_refreshed or not startup_ct_attempted:
+                    await self._async_persist_store("startup")
+                else:
+                    _LOGGER.warning(
+                        "[v%s] Skipping initial LDATA state save because startup CT true-up did not complete",
+                        self._service.version,
+                    )
 
             self._log_data_if_enabled(returnData, "API")
             return returnData
