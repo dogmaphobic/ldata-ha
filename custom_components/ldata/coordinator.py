@@ -316,6 +316,16 @@ class LDATAUpdateCoordinator(DataUpdateCoordinator):
                     "WebSocket Loop"
                 )
 
+    async def async_poke_panel(self, panel_id: str) -> bool:
+        """Force a targeted panel refresh and publish any fresh data immediately."""
+        refreshed = await self._service.poke_panel(panel_id)
+        data = self._service.status_data
+        if refreshed and data:
+            self._log_data_if_enabled(data, "Manual Poke")
+            self.async_set_updated_data(data)
+            self._queue_store_save()
+        return refreshed
+
     def _log_data_if_enabled(self, data, source: str = ""):
         options = self.config_entry.options
         if options.get("log_parsed_data", False):

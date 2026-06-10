@@ -1206,7 +1206,7 @@ class LDATAService:
         finally:
             self._rest_poll_lock.release()
 
-    async def _refresh_panel_data_locked(self) -> bool:
+    async def _refresh_panel_data_locked(self, panel_ids: set[str] | None = None) -> bool:
         new_status_data = self.status_data.copy()
         panels = new_status_data.get("panels", []).copy()
         breakers = new_status_data.get("breakers", {}).copy()
@@ -1216,6 +1216,8 @@ class LDATAService:
             panel_id = panel_data.get("id")
             panel_type = panel_data.get("panel_type", "WHEMS")
             if not panel_id:
+                continue
+            if panel_ids is not None and panel_id not in panel_ids:
                 continue
 
             try:
@@ -1314,7 +1316,11 @@ class LDATAService:
         finally:
             self._rest_poll_lock.release()
 
-    async def _refresh_ct_data_locked(self) -> bool:
+    async def _refresh_ct_data_locked(
+        self,
+        panel_ids: set[str] | None = None,
+        reason: str = "hourly",
+    ) -> bool:
         new_status_data = self.status_data.copy()
         cts = new_status_data.get("cts", {}).copy()
         updated = False
@@ -1322,11 +1328,13 @@ class LDATAService:
         for panel_data in new_status_data.get("panels", []):
             panel_id = panel_data.get("id")
             if not panel_id or not self._panel_needs_ct_poll.get(panel_id, False): continue
+            if panel_ids is not None and panel_id not in panel_ids:
+                continue
             
             try:
                 panel_type = panel_data.get("panel_type", "WHEMS")
                 
-                _LOGGER.warning("[v%s] Executing hourly bandwidth toggle for panel %s to sync hardware CT counters.", self.version, panel_id)
+                _LOGGER.warning("[v%s] Executing %s bandwidth toggle for panel %s to sync hardware CT counters.", self.version, reason, panel_id)
                 await self._bandwidth_toggle(panel_id, panel_type)
                 
                 await asyncio.sleep(5) 
@@ -1348,3 +1356,65 @@ class LDATAService:
             new_status_data["cts"] = cts
             self.status_data = new_status_data
         return updated
+
+    async def poke_panel(self, panel_id: str) -> bool:
+        """Force a targeted Leviton refresh for one panel's breaker and CT data."""
+        if not self.status_data or not self.status_data.get("panels"):
+            return False
+        if not self.auth_token:
+            return False
+
+        panel_id = str(panel_id or "").strip()
+        if not panel_id:
+            return False
+
+        known_panel_ids = {
+            str(panel.get("id"))
+            for panel in self.status_data.get("panels", [])
+            if panel.get("id")
+        }
+        if panel_id not in known_panel_ids:
+            _LOGGER.warning("[v%s] poke_panel ignored unknown panel %s", self.version, panel_id)
+            return False
+
+        try:
+            async with asyncio.timeout(30):
+                await self._rest_poll_lock.acquire()
+        except asyncio.TimeoutError:
+            return False
+
+        try:
+            panel_ids = {panel_id}
+            panel_refreshed = await self._refresh_panel_data_locked(panel_ids)
+            ct_refreshed = await self._refresh_ct_data_locked(panel_ids, "manual")
+            refreshed = panel_refreshed or ct_refreshed
+            if refreshed:
+                self._mark_panel_poked(panel_id)
+            _LOGGER.warning(
+                "[v%s] Manual poke for panel %s completed (panel=%s, ct=%s)",
+                self.version,
+                panel_id,
+                panel_refreshed,
+                ct_refreshed,
+            )
+            return refreshed
+        finally:
+            self._rest_poll_lock.release()
+
+    def _mark_panel_poked(self, panel_id: str) -> None:
+        """Stamp panel members so HA publishes a fresh state even if values match."""
+        if not self.status_data:
+            return
+
+        marker = time.time()
+        for panel in self.status_data.get("panels", []):
+            if panel.get("id") == panel_id:
+                panel["last_manual_poke_time"] = marker
+
+        for breaker in self.status_data.get("breakers", {}).values():
+            if breaker.get("panel_id") == panel_id:
+                breaker["last_manual_poke_time"] = marker
+
+        for ct in self.status_data.get("cts", {}).values():
+            if ct.get("panel_id") == panel_id:
+                ct["last_manual_poke_time"] = marker

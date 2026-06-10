@@ -90,5 +90,7 @@ class LDATAEntity(CoordinatorEntity[LDATAUpdateCoordinator]):
         """Returns the extra attributes for the breaker."""
         attributes = {}
         attributes["leg"] = self.leg
+        if self.entity_data.get("last_manual_poke_time") is not None:
+            attributes["last_manual_poke_time"] = self.entity_data.get("last_manual_poke_time")
 
         return attributes

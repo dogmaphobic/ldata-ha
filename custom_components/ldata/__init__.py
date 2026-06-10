@@ -19,11 +19,19 @@ PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.SENSOR, Platform.S
 _LOGGER = logging.getLogger(LOGGER_NAME)
 
 SERVICE_RESET_PANEL = "reset_panel_energy"
+SERVICE_POKE_PANEL = "poke_panel"
 ATTR_DEVICE_ID = "device_id"
+ATTR_PANEL_ID = "panel_id"
 
 SERVICE_RESET_PANEL_SCHEMA = vol.Schema(
     {
         vol.Required(ATTR_DEVICE_ID): cv.string,
+    }
+)
+
+SERVICE_POKE_PANEL_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_PANEL_ID): cv.string,
     }
 )
 
@@ -187,6 +195,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             SERVICE_RESET_PANEL,
             handle_reset_panel_energy,
             schema=SERVICE_RESET_PANEL_SCHEMA,
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_POKE_PANEL):
+        async def handle_poke_panel(call: ServiceCall) -> None:
+            """Force a targeted Leviton panel refresh."""
+            panel_id = str(call.data[ATTR_PANEL_ID]).strip()
+            refreshed = False
+            for coordinator in hass.data.get(DOMAIN, {}).values():
+                if not isinstance(coordinator, LDATAUpdateCoordinator) or not coordinator.data:
+                    continue
+                if not any(
+                    panel.get("id") == panel_id
+                    for panel in coordinator.data.get("panels", [])
+                ):
+                    continue
+
+                refreshed = await coordinator.async_poke_panel(panel_id)
+                break
+
+            if not refreshed:
+                _LOGGER.warning("poke_panel: no fresh data for panel %s", panel_id)
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_POKE_PANEL,
+            handle_poke_panel,
+            schema=SERVICE_POKE_PANEL_SCHEMA,
         )
 
     return True

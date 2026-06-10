@@ -56,3 +56,17 @@ reset_panel_energy:
       selector:
         device:
           integration: ldata
+
+poke_panel:
+  name: Poke panel
+  description: >-
+    Force a targeted Leviton refresh for one panel's breaker and CT data.
+    This is intended for verification workflows when cached breaker values
+    look stale or inconsistent.
+  fields:
+    panel_id:
+      name: Panel ID
+      description: Leviton panel identifier, such as 1000_002F_AEA7.
+      required: true
+      selector:
+        text: {}

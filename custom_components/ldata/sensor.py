@@ -840,6 +840,8 @@ class LDATAOutputSensor(LDATAEntity, SensorEntity):
         try:
             if breakers := self.coordinator.data.get("breakers"):
                 if new_data := breakers.get(self.breaker_data["id"]):
+                    self.breaker_data = new_data
+                    self.entity_data = new_data
                     self._state = new_data[self.entity_description.key]
                 else:
                     self._state = None
@@ -1002,6 +1004,8 @@ class LDATACTOutputSensor(LDATACTEntity, SensorEntity):
         try:
             if cts := self.coordinator.data.get("cts"):
                 if new_data := cts.get(self.ct_data["id"]):
+                    self.ct_data = new_data
+                    self.entity_data = new_data
                     self._state = float(new_data[self.entity_description.key])
                 else:
                     self._state = None

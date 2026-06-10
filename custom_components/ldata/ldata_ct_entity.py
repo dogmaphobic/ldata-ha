@@ -85,5 +85,7 @@ class LDATACTEntity(CoordinatorEntity[LDATAUpdateCoordinator]):
         attributes = {}
         attributes["channel"] = self.entity_data.get("channel")
         attributes["panel_id"] = self.entity_data.get("panel_id")
+        if self.entity_data.get("last_manual_poke_time") is not None:
+            attributes["last_manual_poke_time"] = self.entity_data.get("last_manual_poke_time")
 
         return attributes
